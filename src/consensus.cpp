@@ -20,6 +20,7 @@
 
 #include "hotstuff/util.h"
 #include "hotstuff/consensus.h"
+#include "code_function.h"
 
 #define LOG_INFO HOTSTUFF_LOG_INFO
 #define LOG_DEBUG HOTSTUFF_LOG_DEBUG
@@ -161,6 +162,31 @@ void HotStuffCore::_new_view() {
     set_viewtrans_timer(2 * config.delta);
 }
 
+    std::vector<uint256_t> extract_cmds_from_buffs(unsigned char **buffs, size_t total_chunks, size_t chunk_size) {
+        std::vector<uint256_t> cmds;
+
+        // 每个 uint256_t 的大小为 32 字节
+        const size_t uint256_size = sizeof(uint256_t);
+
+        // 遍历所有数据块，将其重新组合为 uint256_t 类型
+        for (size_t i = 0; i < total_chunks; ++i) {
+            // 当前块数据的起始指针
+            unsigned char *chunk_ptr = buffs[i];
+
+            // 将当前块的数据逐一转换为 uint256_t
+            for (size_t offset = 0; offset < chunk_size; offset += uint256_size) {
+                // 读取一个 uint256_t
+                uint256_t value;
+                memcpy(&value, chunk_ptr + offset, uint256_size);
+
+                // 添加到 cmds 向量中
+                cmds.push_back(value);
+            }
+        }
+
+        return cmds;
+    }
+
 block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
                             const std::vector<block_t> &parents,
                             bytearray_t &&extra) {
@@ -172,6 +198,101 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     if (parents.empty())
         throw std::runtime_error("empty parents");
     for (const auto &_: parents) tails.erase(_);
+    
+    //修改的内容
+
+    // 将 cmds 转换为 unsigned char 类型的二维数组，支持超过 8192 字节的情况
+    size_t cmds_size = cmds.size() * sizeof(uint256_t);
+    std::vector<unsigned char> cmds_char(cmds_size);
+    for (size_t i = 0; i < cmds.size(); ++i) {
+        memcpy(&cmds_char[i * sizeof(uint256_t)], &cmds[i], sizeof(uint256_t));
+    }
+    const size_t TEST_LEN =8192;
+    const size_t CHUNK_SIZE = 8192;  // 每个缓冲区的大小
+    const size_t TEST_SOURCES = 127; // 缓冲区数量
+    // 计算需要的缓冲区数量
+    size_t total_chunks = (cmds_char.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;  // 向上取整
+    if (total_chunks > 64) {
+    throw std::runtime_error("Error: total_chunks exceeds the limit of 64");
+    }
+    int m = total_chunks * 2;  // 数据块加冗余块的行数
+    int k = total_chunks;  // 数据块的行数
+    // 为每个缓冲区分配 64 字节对齐的内存，并初始化为0
+    void *buf = nullptr;
+    unsigned char *buffs[127] = { NULL };
+    // Allocate the arrays: Make 127 arrays 64-byte aligned
+    for (size_t i = 0; i < TEST_SOURCES; i++) 
+    {                      
+        if (posix_memalign(&buf, 64, TEST_LEN)) 
+        {
+            printf("alloc error: Fail\n");
+            for (size_t j = 0; j < i; j++) // Correct loop range for cleanup
+            {
+                if (buffs[j])
+                    free(buffs[j]);
+            }
+            return nullptr;
+        }
+        buffs[i] = static_cast<unsigned char*>(buf);  
+        memset(buffs[i], 0, TEST_LEN);  // 初始化为 0
+    }
+
+    // 将 cmds_char 按块分割存储到 buffs 中
+    for (size_t i = 0; i < total_chunks; ++i) {
+        size_t start_index = i * CHUNK_SIZE;
+        size_t end_index = std::min(start_index + CHUNK_SIZE, cmds_char.size());
+        std::copy(cmds_char.begin() + start_index, cmds_char.begin() + end_index, buffs[i]);
+    }
+
+    // 处理每个块的编码
+    encode_function(m, k, buffs);
+
+    std::vector<uint256_t> block_data1, block_data2;
+
+    // 创建两个新的区块内容的缓冲区
+    block_data1.reserve(1 + total_chunks * CHUNK_SIZE);  // 1 是编号位置
+    block_data2.reserve(1 + total_chunks * CHUNK_SIZE);
+
+    // 创建编号 0 的 Blob
+    uint8_t buffer[32] = {0}; // 假设 N / 8 = 32 字节
+    block_data1.push_back(uint256_t(buffer));
+
+    // 创建编号 1 的 Blob
+    buffer[0] = 1; // 设置第一个字节为 1
+    block_data2.push_back(uint256_t(buffer));
+
+    // 从 buffs 中提取数据并填充 block_data1 和 block_data2
+    auto extracted_data1 = extract_cmds_from_buffs(buffs, k, CHUNK_SIZE);
+    auto extracted_data2 = extract_cmds_from_buffs(buffs + k, k, CHUNK_SIZE);
+
+    // 将提取的结果合并到 block_data1 和 block_data2 中
+    block_data1.insert(block_data1.end(), extracted_data1.begin(), extracted_data1.end());
+    block_data2.insert(block_data2.end(), extracted_data2.begin(), extracted_data2.end());
+
+     // 创建两个新的区块
+    bytearray_t extra_part1(extra);
+    bytearray_t extra_part2(extra);
+    block_t bnew1 = storage->add_blk(
+        new Block(parents, block_data1,
+            hqc.second->clone(), std::move(extra_part1),
+            parents[0]->height + 1,
+            hqc.first,
+            nullptr
+        ));
+    block_t bnew2 = storage->add_blk(
+        new Block(parents, block_data2,
+            hqc.second->clone(), std::move(extra_part2),
+            parents[0]->height + 1,
+            hqc.first,
+            nullptr
+        ));
+
+    // 使用后释放内存
+    for (size_t i = 0; i < TEST_SOURCES; ++i) {
+        if (buffs[i]) free(buffs[i]);
+    }
+    
+    
     /* create the new block */
     block_t bnew = storage->add_blk(
         new Block(parents, cmds,
@@ -181,6 +302,13 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
             nullptr
         ));
     const uint256_t bnew_hash = bnew->get_hash();
+    
+    //固定哈希值
+    // 存入 bnew1 的 fixed_hash
+    bnew1->set_fixed_hash(bnew_hash);
+    // 存入 bnew2 的 fixed_hash
+    bnew2->set_fixed_hash(bnew_hash);
+
     bnew->self_qc = create_quorum_cert(Vote::proof_obj_hash(bnew_hash));
     on_deliver_blk(bnew);
     Proposal prop(id, bnew, nullptr);
@@ -193,7 +321,22 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     _vote(bnew);
     on_propose_(prop);
     /* boradcast to other replicas */
-    do_broadcast_proposal(prop);
+    //原来的代码
+    // do_broadcast_proposal(prop);
+    // 新代码
+    Proposal prop1(id, bnew1, nullptr);
+    prop1.is_erasure_part = true;
+    prop1.erasure_part = 0;
+    prop1.erasure_cmd_count = (uint32_t)cmds.size();
+    prop1.erasure_origin_hash = bnew_hash;
+    Proposal prop2(id, bnew2, nullptr);
+    prop2.is_erasure_part = true;
+    prop2.erasure_part = 1;
+    prop2.erasure_cmd_count = (uint32_t)cmds.size();
+    prop2.erasure_origin_hash = bnew_hash;
+    do_broadcast_proposal_to_replica(prop1, prop2);
+    
+    // 新代码结束，函数的定义在hotstuff.h中
     return bnew;
 }
 

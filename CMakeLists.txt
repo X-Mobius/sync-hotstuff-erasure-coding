@@ -42,6 +42,8 @@ set_target_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/secp256k1/.libs/libsecp256k1.a)
 add_dependencies(secp256k1 libsecp256k1)
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # add libraries
 
 include_directories(./)
@@ -54,7 +56,10 @@ add_library(hotstuff
     src/entity.cpp
     src/consensus.cpp
     src/hotstuff.cpp
+    src/code_function.c
     )
+# 明确标记 code_function.c 是 C 文件
+set_source_files_properties(src/code_function.c PROPERTIES LANGUAGE C)
 
 option(BUILD_SHARED "build shared library." OFF)
 if(BUILD_SHARED)

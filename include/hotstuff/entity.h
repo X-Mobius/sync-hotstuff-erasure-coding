@@ -136,19 +136,28 @@ class Block {
 
     std::unordered_set<ReplicaID> voted;
 
-    public:
+    // 新增字段：用于存储固定的哈希值
+    uint256_t fixed_hash;
+
+public:
     Block():
         qc(nullptr),
         qc_ref(nullptr),
-        self_qc(nullptr), height(0),
-        delivered(false), decision(0) {}
+        self_qc(nullptr),
+        height(0),
+        delivered(false),
+        decision(0),
+        fixed_hash(uint256_t()) {} // 默认初始化 fixed_hash
 
-    Block(bool delivered, int8_t decision):
+    Block(bool delivered, int8_t decision, const uint256_t &fixed_hash = uint256_t()):
         qc(nullptr),
         hash(salticidae::get_hash(*this)),
         qc_ref(nullptr),
-        self_qc(nullptr), height(0),
-        delivered(delivered), decision(decision) {}
+        self_qc(nullptr),
+        height(0),
+        delivered(delivered),
+        decision(decision),
+        fixed_hash(fixed_hash) {} // 初始化 fixed_hash
 
     Block(const std::vector<block_t> &parents,
         const std::vector<uint256_t> &cmds,
@@ -157,6 +166,7 @@ class Block {
         uint32_t height,
         const block_t &qc_ref,
         quorum_cert_bt &&self_qc,
+        const uint256_t &fixed_hash = uint256_t(),
         int8_t decision = 0):
             parent_hashes(get_hashes(parents)),
             cmds(cmds),
@@ -169,14 +179,29 @@ class Block {
             self_qc(std::move(self_qc)),
             height(height),
             delivered(0),
-            decision(decision) {}
+            decision(decision),
+            fixed_hash(fixed_hash) {} // 初始化 fixed_hash
 
     void serialize(DataStream &s) const;
 
     void unserialize(DataStream &s, HotStuffCore *hsc);
 
+    // Getter 方法
+    const uint256_t &get_fixed_hash() const {
+        return fixed_hash;
+    }
+
+    // Setter 方法（可选）
+    void set_fixed_hash(const uint256_t &value) {
+        fixed_hash = value;
+    }
+
     const std::vector<uint256_t> &get_cmds() const {
         return cmds;
+    }
+
+    void set_cmds(const std::vector<uint256_t> &new_cmds) {
+        cmds = new_cmds;
     }
 
     const std::vector<block_t> &get_parents() const {
@@ -212,7 +237,8 @@ class Block {
           << "id="  << get_hex10(hash) << " "
           << "height=" << std::to_string(height) << " "
           << "parent=" << get_hex10(parent_hashes[0]) << " "
-          << "qc_ref=" << (qc_ref ? get_hex10(qc_ref->get_hash()) : "null") << ">";
+          << "qc_ref=" << (qc_ref ? get_hex10(qc_ref->get_hash()) : "null") << " "
+          << "fixed_hash=" << get_hex10(fixed_hash) << ">"; // 显示 fixed_hash
         return std::move(s);
     }
 };

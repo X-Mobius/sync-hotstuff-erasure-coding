@@ -188,6 +188,8 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
+    /* New command storage map 新加的*/
+    std::unordered_map<uint256_t, std::vector<std::vector<uint256_t>>> cmd_storage;
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::queue<uint256_t> cmd_pending_buffer;
@@ -257,6 +259,22 @@ class HotStuffBase: public HotStuffCore {
 
     void do_broadcast_proposal(const Proposal &prop) override {
         _do_broadcast<Proposal, MsgPropose>(prop);
+    }
+
+    template<typename T, typename M>
+    void _send_to_two_replicas(const T &prop1, const T &prop2) {
+        if (peers.size() < 2) {
+            throw std::runtime_error("Not enough peers to send messages to two replicas.");
+        }
+
+        // Send both encoded parts to every replica. This keeps the stock demo
+        // path live until the Re-propose forwarding step is implemented.
+        pn.multicast_msg(M(prop1), peers);
+        pn.multicast_msg(M(prop2), peers);
+    }
+
+    void do_broadcast_proposal_to_replica(const Proposal &prop1, const Proposal &prop2) override {
+        _send_to_two_replicas<Proposal, MsgPropose>(prop1, prop2);
     }
 
     void do_broadcast_vote(const Vote &vote) override {
@@ -332,6 +350,11 @@ class HotStuffBase: public HotStuffCore {
 #ifdef SYNCHS_AUTOCLI
     virtual void do_demand_commands(size_t) {}
 #endif
+
+    // Methods for managing cmd_storage 新加
+    void add_cmd_storage(const uint256_t &blk_hash, const std::vector<uint256_t> &data, size_t part);
+    std::vector<uint256_t> get_cmd_part(const uint256_t &blk_hash, size_t part) const;
+    bool is_cmd_complete(const uint256_t &blk_hash) const;
 
     /* Helper functions */
     /** Returns a promise resolved (with command_t cmd) when Command is fetched. */
