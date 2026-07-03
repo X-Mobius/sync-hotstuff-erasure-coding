@@ -2,20 +2,21 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
 
-ITER="${ITER:-300}"
 ASYNC_VALUES="${ASYNC_VALUES:-1 3 8 16}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-3}"
 CLIENT_SECONDS="${CLIENT_SECONDS:-30}"
 REPLICAS="${REPLICAS:-0 1 2}"
 OUT_DIR="${OUT_DIR:-benchmarks/$(date +%Y%m%d-%H%M%S)}"
 CLIENT_IDX="${CLIENT_IDX:-0}"
+CONF_DIR="${CONF_DIR:-$ROOT_DIR}"
+CLIENT_CONF="${CLIENT_CONF:-hotstuff.conf}"
+APP_CONF_PREFIX="${APP_CONF_PREFIX:-hotstuff-sec}"
 
 mkdir -p "$OUT_DIR"
 SUMMARY_CSV="$OUT_DIR/summary.csv"
 
-if pgrep -f "hotstuff-app --conf ./hotstuff-sec" >/dev/null 2>&1; then
+if pgrep -f "hotstuff-app --conf" >/dev/null 2>&1; then
     echo "Existing hotstuff-app processes are running. Stop them before benchmarking." >&2
     exit 1
 fi
@@ -29,7 +30,10 @@ run_one() {
 
     local pids=()
     for replica in $REPLICAS; do
-        ./examples/hotstuff-app --conf "./hotstuff-sec${replica}.conf" \
+        (
+            cd "$CONF_DIR"
+            "$ROOT_DIR/examples/hotstuff-app" --conf "${APP_CONF_PREFIX}${replica}.conf"
+        ) \
             > "$run_dir/replica${replica}.log" 2>&1 &
         pids+=("$!")
     done
@@ -49,8 +53,14 @@ run_one() {
     local start_epoch end_epoch client_rc
     start_epoch="$(date +%s.%N)"
     set +e
-    timeout "$CLIENT_SECONDS" ./examples/hotstuff-client --idx "$CLIENT_IDX" --iter -1 --max-async "$async" \
-        > "$run_dir/client.stdout" 2> "$run_dir/client.log"
+    (
+        cd "$CONF_DIR"
+        timeout "$CLIENT_SECONDS" "$ROOT_DIR/examples/hotstuff-client" \
+        --conf "$CLIENT_CONF" \
+        --idx "$CLIENT_IDX" \
+        --iter -1 \
+        --max-async "$async" \
+    ) > "$run_dir/client.stdout" 2> "$run_dir/client.log"
     client_rc="$?"
     set -e
     end_epoch="$(date +%s.%N)"
@@ -85,7 +95,6 @@ decided_re = re.compile(r"\[hotstuff info\] decided: (?P<n>\d+)")
 
 latencies = []
 heights = []
-finish_times = []
 
 client_log = run_dir / "client.log"
 for line in client_log.read_text(errors="replace").splitlines():
@@ -94,8 +103,6 @@ for line in client_log.read_text(errors="replace").splitlines():
         continue
     latencies.append(float(m.group("wall")))
     heights.append(int(m.group("height")))
-    ts = dt.datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S.%f")
-    finish_times.append(ts.timestamp())
 
 def percentile(values, pct):
     if not values:
@@ -112,9 +119,10 @@ sent_total = 0
 recv_total = 0
 max_decided = 0
 for log_path in sorted(run_dir.glob("replica*.log")):
-    sent_values = [int(m.group("n")) for m in sent_re.finditer(log_path.read_text(errors="replace"))]
-    recv_values = [int(m.group("n")) for m in recv_re.finditer(log_path.read_text(errors="replace"))]
-    decided_values = [int(m.group("n")) for m in decided_re.finditer(log_path.read_text(errors="replace"))]
+    text = log_path.read_text(errors="replace")
+    sent_values = [int(m.group("n")) for m in sent_re.finditer(text)]
+    recv_values = [int(m.group("n")) for m in recv_re.finditer(text)]
+    decided_values = [int(m.group("n")) for m in decided_re.finditer(text)]
     if sent_values:
         sent_total += max(sent_values)
     if recv_values:
@@ -153,7 +161,7 @@ PY
 }
 
 for async in $ASYNC_VALUES; do
-    echo "=== Running benchmark: seconds=$CLIENT_SECONDS max_async=$async ==="
+    echo "=== Running benchmark: seconds=$CLIENT_SECONDS max_async=$async replicas=[$REPLICAS] ==="
     run_one "$async"
 done
 
