@@ -12,6 +12,7 @@ CLIENT_IDX="${CLIENT_IDX:-0}"
 CONF_DIR="${CONF_DIR:-$ROOT_DIR}"
 CLIENT_CONF="${CLIENT_CONF:-hotstuff.conf}"
 APP_CONF_PREFIX="${APP_CONF_PREFIX:-hotstuff-sec}"
+DROP_PROPOSE_PCT="${DROP_PROPOSE_PCT:-0}"
 
 mkdir -p "$OUT_DIR"
 SUMMARY_CSV="$OUT_DIR/summary.csv"
@@ -32,6 +33,7 @@ run_one() {
     for replica in $REPLICAS; do
         (
             cd "$CONF_DIR"
+            HOTSTUFF_DROP_PROPOSE_PCT="$DROP_PROPOSE_PCT" \
             "$ROOT_DIR/examples/hotstuff-app" --conf "${APP_CONF_PREFIX}${replica}.conf"
         ) \
             > "$run_dir/replica${replica}.log" 2>&1 &

@@ -18,7 +18,11 @@
 #include "hotstuff/hotstuff.h"
 #include "hotstuff/client.h"
 #include "hotstuff/liveness.h"
+#include <cstdlib>
+#include <random>
 #include "code_function.h"
+#include <cstdlib>
+#include <random>
 
 using salticidae::static_pointer_cast;
 
@@ -27,6 +31,29 @@ using salticidae::static_pointer_cast;
 #define LOG_WARN HOTSTUFF_LOG_WARN
 
 namespace hotstuff {
+
+namespace {
+
+int get_drop_propose_pct() {
+    static int pct = []() {
+        const char *env = std::getenv("HOTSTUFF_DROP_PROPOSE_PCT");
+        if (!env) return 0;
+        int value = std::atoi(env);
+        if (value < 0) return 0;
+        if (value > 100) return 100;
+        return value;
+    }();
+    return pct;
+}
+
+bool should_drop_proposal() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(1, 100);
+    int pct = get_drop_propose_pct();
+    return pct > 0 && dist(rng) <= pct;
+}
+
+} // namespace
 
 const opcode_t MsgPropose::opcode;
 MsgPropose::MsgPropose(const Proposal &proposal) { serialized << proposal; }
@@ -259,6 +286,10 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     auto &prop = msg.proposal;
     block_t blk = prop.blk;
     if (!blk) return;
+    if (should_drop_proposal()) {
+        LOG_WARN("dropping proposal due to HOTSTUFF_DROP_PROPOSE_PCT=%d", get_drop_propose_pct());
+        return;
+    }
 
     if (!prop.is_erasure_part)
     {
