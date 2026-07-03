@@ -21,4 +21,9 @@ include/hotstuff/config.h
 /test/Makefile
 /test/test_secp256k1
 /test/test_concurrent_queue
+/test/test_functions
+/benchmarks/
+/log0
+/log1
+/log2
 core
