@@ -258,7 +258,10 @@ class HotStuffBase: public HotStuffCore {
     }
 
     void do_broadcast_proposal(const Proposal &prop) override {
-        _do_broadcast<Proposal, MsgPropose>(prop);
+        MsgPropose msg(prop);
+        HOTSTUFF_LOG_INFO("proposal_wire_bytes: %lu",
+                msg.serialized.size() * peers.size());
+        pn.multicast_msg(std::move(msg), peers);
     }
 
     template<typename T, typename M>
@@ -269,8 +272,12 @@ class HotStuffBase: public HotStuffCore {
 
         // Send both encoded parts to every replica. This keeps the stock demo
         // path live until the Re-propose forwarding step is implemented.
-        pn.multicast_msg(M(prop1), peers);
-        pn.multicast_msg(M(prop2), peers);
+        M msg1(prop1);
+        M msg2(prop2);
+        HOTSTUFF_LOG_INFO("proposal_wire_bytes: %lu",
+                (msg1.serialized.size() + msg2.serialized.size()) * peers.size());
+        pn.multicast_msg(std::move(msg1), peers);
+        pn.multicast_msg(std::move(msg2), peers);
     }
 
     void do_broadcast_proposal_to_replica(const Proposal &prop1, const Proposal &prop2) override {

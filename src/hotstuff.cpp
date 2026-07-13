@@ -21,8 +21,6 @@
 #include <cstdlib>
 #include <random>
 #include "code_function.h"
-#include <cstdlib>
-#include <random>
 
 using salticidae::static_pointer_cast;
 
@@ -51,6 +49,17 @@ bool should_drop_proposal() {
     std::uniform_int_distribution<int> dist(1, 100);
     int pct = get_drop_propose_pct();
     return pct > 0 && dist(rng) <= pct;
+}
+
+uint32_t get_nfaulty(size_t nreplicas, uint32_t fallback) {
+    const char *env = std::getenv("HOTSTUFF_NFAULTY");
+    if (!env || !*env) return fallback;
+    char *end = nullptr;
+    unsigned long value = std::strtoul(env, &end, 10);
+    if (*end != '\0' || value >= nreplicas)
+        throw HotStuffError("invalid HOTSTUFF_NFAULTY=%s for %lu replicas",
+                env, nreplicas);
+    return static_cast<uint32_t>(value);
 }
 
 } // namespace
@@ -708,9 +717,12 @@ void HotStuffBase::start(
     }
 
     /* ((n - 1) + 1 - 1) / 2 */
-    uint32_t nfaulty = peers.size() / 2;
+    const size_t nreplicas = get_config().nreplicas;
+    uint32_t nfaulty = get_nfaulty(nreplicas, peers.size() / 2);
     if (nfaulty == 0)
         LOG_WARN("too few replicas in the system to tolerate any failure");
+    LOG_INFO("benchmark_config replicas=%lu nfaulty=%u quorum=%lu",
+            nreplicas, nfaulty, nreplicas - nfaulty);
     on_init(nfaulty, delta);
     pmaker->init(this);
     if (ec_loop)
