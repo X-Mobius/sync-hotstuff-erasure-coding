@@ -16,6 +16,7 @@ DROP_PROPOSE_PCT="${DROP_PROPOSE_PCT:-0}"
 NFAULTY="${NFAULTY:-}"
 IMPLEMENTATION="${IMPLEMENTATION:-unknown}"
 SCENARIO="${SCENARIO:-custom}"
+RESUME="${RESUME:-0}"
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
@@ -26,7 +27,20 @@ if pgrep -f "hotstuff-app --conf" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "implementation,scenario,nfaulty,quorum,configured_nodes,active_nodes,drop_propose_pct,repeat,async,client_seconds,confirmed,max_height,avg_latency_s,min_latency_s,p50_latency_s,p95_latency_s,max_latency_s,throughput_ops_s,client_rc,replica_sent_msgs,replica_recv_msgs,proposal_wire_bytes,proposal_bytes_per_confirmed,max_decided,live" > "$SUMMARY_CSV"
+HEADER="implementation,scenario,nfaulty,quorum,configured_nodes,active_nodes,drop_propose_pct,repeat,async,client_seconds,confirmed,max_height,avg_latency_s,min_latency_s,p50_latency_s,p95_latency_s,max_latency_s,throughput_ops_s,client_rc,replica_sent_msgs,replica_recv_msgs,proposal_wire_bytes,proposal_bytes_per_confirmed,max_decided,live"
+if [[ "$RESUME" != 1 || ! -s "$SUMMARY_CSV" ]]; then
+    echo "$HEADER" > "$SUMMARY_CSV"
+elif [[ "$(head -n 1 "$SUMMARY_CSV")" != "$HEADER" ]]; then
+    echo "Cannot resume: unexpected CSV header in $SUMMARY_CSV" >&2
+    exit 1
+fi
+
+is_completed() {
+    local repeat="$1" async="$2"
+    awk -F, -v repeat="$repeat" -v async="$async" \
+        'NR > 1 && $8 == repeat && $9 == async { found = 1 } END { exit !found }' \
+        "$SUMMARY_CSV"
+}
 
 run_one() {
     local repeat="$1" async="$2"
@@ -136,6 +150,10 @@ PY
 
 for repeat in $(seq 1 "$REPETITIONS"); do
     for async in $ASYNC_VALUES; do
+        if [[ "$RESUME" == 1 ]] && is_completed "$repeat" "$async"; then
+            echo "=== Skipping completed: $IMPLEMENTATION $SCENARIO repeat=$repeat async=$async f=$NFAULTY ==="
+            continue
+        fi
         echo "=== $IMPLEMENTATION $SCENARIO repeat=$repeat async=$async f=$NFAULTY replicas=[$REPLICAS] ==="
         run_one "$repeat" "$async"
     done

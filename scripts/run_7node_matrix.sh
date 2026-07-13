@@ -5,6 +5,7 @@ STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 CLIENT_SECONDS="${CLIENT_SECONDS:-30}"
 REPETITIONS="${REPETITIONS:-3}"
 ASYNC_VALUES="${ASYNC_VALUES:-1 3 8 16}"
+RESUME="${RESUME:-0}"
 RESULT_ROOT="${RESULT_ROOT:-$HOME/benchmarks-7node-$STAMP}"
 
 run_case() {
@@ -14,6 +15,7 @@ run_case() {
     IMPLEMENTATION="$implementation" SCENARIO="$scenario" NFAULTY="$nfaulty" \
     REPLICAS="$replicas" DROP_PROPOSE_PCT="$drop" CLIENT_SECONDS="$CLIENT_SECONDS" \
     REPETITIONS="$REPETITIONS" ASYNC_VALUES="$ASYNC_VALUES" \
+    RESUME="$RESUME" \
     CONF_DIR="$root/benchmarks/conf-7node" CLIENT_CONF="hotstuff-7.conf" \
     APP_CONF_PREFIX="hotstuff-sec" OUT_DIR="$out" ./scripts/perf_benchmark.sh
 }
