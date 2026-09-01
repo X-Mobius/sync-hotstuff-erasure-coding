@@ -146,7 +146,7 @@ class HotStuffCore {
      * The user should send the proposal message to all replicas except for
      * itself. */
     virtual void do_broadcast_proposal(const Proposal &prop) = 0;
-    virtual void do_broadcast_proposal_to_replica(const Proposal &prop1, const Proposal &prop2) = 0;
+    virtual void do_send_erasure_proposals(const std::vector<Proposal> &proposals) = 0;
     virtual void do_broadcast_vote(const Vote &vote) = 0;
     virtual void do_broadcast_blame(const Blame &blame) = 0;
     virtual void do_broadcast_blamenotify(const BlameNotify &bn) = 0;
@@ -221,19 +221,25 @@ struct Proposal: public Serializable {
      * a pointer to the object of the class derived from HotStuffCore */
     HotStuffCore *hsc;
     bool is_erasure_part;
-    uint8_t erasure_part;
+    uint16_t erasure_part;
+    uint16_t erasure_n;
+    uint16_t erasure_k;
+    uint32_t erasure_shard_size;
+    uint32_t erasure_payload_size;
     uint32_t erasure_cmd_count;
     uint256_t erasure_origin_hash;
 
     Proposal():
         blk(nullptr), hsc(nullptr), is_erasure_part(false),
-        erasure_part(0), erasure_cmd_count(0), erasure_origin_hash() {}
+        erasure_part(0), erasure_n(0), erasure_k(0), erasure_shard_size(0),
+        erasure_payload_size(0), erasure_cmd_count(0), erasure_origin_hash() {}
     Proposal(ReplicaID proposer,
             const block_t &blk,
             HotStuffCore *hsc):
         proposer(proposer),
         blk(blk), hsc(hsc), is_erasure_part(false),
-        erasure_part(0), erasure_cmd_count(0), erasure_origin_hash() {}
+        erasure_part(0), erasure_n(0), erasure_k(0), erasure_shard_size(0),
+        erasure_payload_size(0), erasure_cmd_count(0), erasure_origin_hash() {}
 
     Proposal(const Proposal &other):
         proposer(other.proposer),
@@ -241,6 +247,10 @@ struct Proposal: public Serializable {
         hsc(other.hsc),
         is_erasure_part(other.is_erasure_part),
         erasure_part(other.erasure_part),
+        erasure_n(other.erasure_n),
+        erasure_k(other.erasure_k),
+        erasure_shard_size(other.erasure_shard_size),
+        erasure_payload_size(other.erasure_payload_size),
         erasure_cmd_count(other.erasure_cmd_count),
         erasure_origin_hash(other.erasure_origin_hash) {}
 
@@ -248,7 +258,11 @@ struct Proposal: public Serializable {
         s << proposer
           << (uint8_t)(is_erasure_part ? 1 : 0);
         if (is_erasure_part)
-            s << erasure_part
+            s << htole(erasure_part)
+              << htole(erasure_n)
+              << htole(erasure_k)
+              << htole(erasure_shard_size)
+              << htole(erasure_payload_size)
               << htole(erasure_cmd_count)
               << erasure_origin_hash;
         s << *blk;
@@ -518,12 +532,23 @@ inline void Proposal::unserialize(DataStream &s) {
     is_erasure_part = flag != 0;
     if (is_erasure_part)
     {
-        s >> erasure_part >> erasure_cmd_count >> erasure_origin_hash;
+        s >> erasure_part >> erasure_n >> erasure_k
+          >> erasure_shard_size >> erasure_payload_size
+          >> erasure_cmd_count >> erasure_origin_hash;
+        erasure_part = letoh(erasure_part);
+        erasure_n = letoh(erasure_n);
+        erasure_k = letoh(erasure_k);
+        erasure_shard_size = letoh(erasure_shard_size);
+        erasure_payload_size = letoh(erasure_payload_size);
         erasure_cmd_count = letoh(erasure_cmd_count);
     }
     else
     {
         erasure_part = 0;
+        erasure_n = 0;
+        erasure_k = 0;
+        erasure_shard_size = 0;
+        erasure_payload_size = 0;
         erasure_cmd_count = 0;
         erasure_origin_hash = uint256_t();
     }

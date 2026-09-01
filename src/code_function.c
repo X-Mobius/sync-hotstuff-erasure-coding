@@ -38,6 +38,8 @@
 
 typedef unsigned char u8;
 
+int gf_invert_matrix(unsigned char *in_mat, unsigned char *out_mat, const int n);
+
 unsigned char gf_mul(unsigned char a, unsigned char b)
 {
 #ifndef GF_LARGE_TABLES
@@ -263,6 +265,70 @@ void encode_function(int m,int k,unsigned char *buffs[TEST_SOURCES])
 	free(invert_matrix);
 	free(g_tbls);
 
+}
+
+int rs_encode_shards(int n, int k, int len, unsigned char **shards)
+{
+	unsigned char *matrix = NULL, *tables = NULL;
+	if (n <= 0 || k <= 0 || k > n || n > MMAX || len <= 0 || shards == NULL)
+		return -1;
+	matrix = malloc((size_t)n * k);
+	tables = malloc((size_t)k * (n - k) * 32);
+	if (matrix == NULL || ((n > k) && tables == NULL)) {
+		free(matrix);
+		free(tables);
+		return -1;
+	}
+	gf_gen_rs_matrix(matrix, n, k);
+	if (n > k) {
+		ec_init_tables(k, n - k, &matrix[k * k], tables);
+		ec_encode_data(len, k, n - k, tables, shards, &shards[k]);
+	}
+	free(matrix);
+	free(tables);
+	return 0;
+}
+
+int rs_reconstruct_data(int n, int k, int len, unsigned char **shards,
+						const unsigned char *present)
+{
+	unsigned char *matrix = NULL, *selected_matrix = NULL;
+	unsigned char *inverse = NULL, *tables = NULL;
+	unsigned char **selected = NULL;
+	int i, j, count = 0, result = -1;
+	if (n <= 0 || k <= 0 || k > n || n > MMAX || len <= 0 ||
+			shards == NULL || present == NULL)
+		return -1;
+	matrix = malloc((size_t)n * k);
+	selected_matrix = malloc((size_t)k * k);
+	inverse = malloc((size_t)k * k);
+	tables = malloc((size_t)k * 32);
+	selected = malloc((size_t)k * sizeof(*selected));
+	if (!matrix || !selected_matrix || !inverse || !tables || !selected)
+		goto exit;
+	gf_gen_rs_matrix(matrix, n, k);
+	for (i = 0; i < n && count < k; ++i) {
+		if (!present[i]) continue;
+		selected[count] = shards[i];
+		for (j = 0; j < k; ++j)
+			selected_matrix[count * k + j] = matrix[i * k + j];
+		++count;
+	}
+	if (count < k || gf_invert_matrix(selected_matrix, inverse, k) < 0)
+		goto exit;
+	for (i = 0; i < k; ++i) {
+		if (present[i]) continue;
+		ec_init_tables(k, 1, &inverse[i * k], tables);
+		ec_encode_data(len, k, 1, tables, selected, &shards[i]);
+	}
+	result = 0;
+exit:
+	free(matrix);
+	free(selected_matrix);
+	free(inverse);
+	free(tables);
+	free(selected);
+	return result;
 }
 unsigned char gf_inv(unsigned char a)
 {

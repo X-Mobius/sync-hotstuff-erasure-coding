@@ -12,3 +12,9 @@ add_executable(test_functions
 
 target_link_libraries(test_functions hotstuff_static)
 
+add_executable(test_reproposal_rs
+    ./test_reproposal_rs.c
+    ../src/code_function.c
+)
+
+target_link_libraries(test_reproposal_rs hotstuff_static)

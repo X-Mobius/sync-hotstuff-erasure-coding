@@ -19,6 +19,7 @@
 #include "hotstuff/client.h"
 #include "hotstuff/liveness.h"
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include "code_function.h"
 
@@ -51,6 +52,11 @@ bool should_drop_proposal() {
     return pct > 0 && dist(rng) <= pct;
 }
 
+bool require_erasure_reconstruction() {
+    const char *env = std::getenv("HOTSTUFF_REQUIRE_ERASURE_RECONSTRUCTION");
+    return env && *env && std::strcmp(env, "0") != 0;
+}
+
 uint32_t get_nfaulty(size_t nreplicas, uint32_t fallback) {
     const char *env = std::getenv("HOTSTUFF_NFAULTY");
     if (!env || !*env) return fallback;
@@ -67,6 +73,13 @@ uint32_t get_nfaulty(size_t nreplicas, uint32_t fallback) {
 const opcode_t MsgPropose::opcode;
 MsgPropose::MsgPropose(const Proposal &proposal) { serialized << proposal; }
 void MsgPropose::postponed_parse(HotStuffCore *hsc) {
+    proposal.hsc = hsc;
+    serialized >> proposal;
+}
+
+const opcode_t MsgRepropose::opcode;
+MsgRepropose::MsgRepropose(const Proposal &proposal) { serialized << proposal; }
+void MsgRepropose::postponed_parse(HotStuffCore *hsc) {
     proposal.hsc = hsc;
     serialized >> proposal;
 }
@@ -250,42 +263,152 @@ promise_t HotStuffBase::async_deliver_blk(const uint256_t &blk_hash,
     return static_cast<promise_t &>(pm);
 }
 
-void HotStuffBase::add_cmd_storage(const uint256_t &blk_hash, const std::vector<uint256_t> &data, size_t part) {
-    // Ensure the block hash's storage is initialized
-    if (cmd_storage.find(blk_hash) == cmd_storage.end()) {
-        cmd_storage[blk_hash] = std::vector<std::vector<uint256_t>>(2); // Initialize with two parts
+bool HotStuffBase::accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
+                                            bool directed) {
+    if (!prop.is_erasure_part || !prop.blk) return false;
+    const size_t expected_n = get_config().nreplicas;
+    const size_t expected_k = expected_n - get_config().nmajority + 1;
+    if (prop.erasure_n != expected_n || prop.erasure_k != expected_k ||
+            prop.erasure_part >= prop.erasure_n || prop.erasure_k == 0 ||
+            prop.erasure_shard_size == 0 ||
+            prop.erasure_shard_size % sizeof(uint256_t) != 0 ||
+            prop.erasure_payload_size !=
+                prop.erasure_cmd_count * sizeof(uint256_t)) {
+        LOG_WARN("dropping erasure fragment with invalid metadata");
+        return false;
+    }
+    if (directed) {
+        if (prop.erasure_part != get_id() ||
+                peer != get_config().get_addr(prop.proposer)) {
+            LOG_WARN("dropping misdirected erasure proposal");
+            return false;
+        }
+    } else if (peer != get_config().get_addr(prop.erasure_part)) {
+        LOG_WARN("dropping erasure fragment forwarded by wrong replica");
+        return false;
     }
 
-    // Store the data in the specified part
-    if (part < 2) {
-        cmd_storage[blk_hash][part] = data;
-    } else {
-        throw std::runtime_error("Invalid part index. Must be 0 or 1.");
+    const auto &fragment_cmds = prop.blk->get_cmds();
+    if (fragment_cmds.size() * sizeof(uint256_t) != prop.erasure_shard_size)
+        return false;
+    const uint256_t origin_hash = prop.erasure_origin_hash;
+    if (completed_erasure.count(origin_hash)) return true;
+    auto found = erasure_assemblies.find(origin_hash);
+    if (found == erasure_assemblies.end()) {
+        ErasureAssembly assembly;
+        assembly.proposer = prop.proposer;
+        assembly.n = prop.erasure_n;
+        assembly.k = prop.erasure_k;
+        assembly.shard_size = prop.erasure_shard_size;
+        assembly.payload_size = prop.erasure_payload_size;
+        assembly.cmd_count = prop.erasure_cmd_count;
+        assembly.template_blk = prop.blk;
+        assembly.shards.resize(assembly.n);
+        assembly.present.assign(assembly.n, 0);
+        found = erasure_assemblies.emplace(origin_hash, std::move(assembly)).first;
     }
+    ErasureAssembly &assembly = found->second;
+    if (assembly.proposer != prop.proposer || assembly.n != prop.erasure_n ||
+            assembly.k != prop.erasure_k ||
+            assembly.shard_size != prop.erasure_shard_size ||
+            assembly.payload_size != prop.erasure_payload_size ||
+            assembly.cmd_count != prop.erasure_cmd_count) {
+        LOG_WARN("dropping inconsistent erasure fragment");
+        return false;
+    }
+    const size_t part = prop.erasure_part;
+    if (!assembly.present[part]) {
+        assembly.shards[part].resize(assembly.shard_size);
+        for (size_t i = 0; i < fragment_cmds.size(); ++i) {
+            bytearray_t raw = fragment_cmds[i];
+            memcpy(assembly.shards[part].data() + i * sizeof(uint256_t),
+                    raw.data(), sizeof(uint256_t));
+        }
+        assembly.present[part] = 1;
+        ++assembly.received;
+        HOTSTUFF_LOG_INFO("erasure_fragment_received: origin=%s part=%lu count=%lu k=%u",
+                get_hex10(origin_hash).c_str(), part, assembly.received, assembly.k);
+    }
+    if (assembly.received < assembly.k) return true;
+
+    std::vector<unsigned char *> shard_ptrs(assembly.n, nullptr);
+    for (size_t i = 0; i < assembly.n; ++i) {
+        void *buf = nullptr;
+        if (posix_memalign(&buf, 64, assembly.shard_size)) {
+            for (auto ptr: shard_ptrs) free(ptr);
+            return false;
+        }
+        shard_ptrs[i] = static_cast<unsigned char *>(buf);
+        memset(shard_ptrs[i], 0, assembly.shard_size);
+        if (assembly.present[i])
+            memcpy(shard_ptrs[i], assembly.shards[i].data(), assembly.shard_size);
+    }
+    if (rs_reconstruct_data(assembly.n, assembly.k, assembly.shard_size,
+                shard_ptrs.data(), assembly.present.data()) != 0) {
+        for (auto ptr: shard_ptrs) free(ptr);
+        LOG_WARN("failed to reconstruct erasure proposal");
+        return false;
+    }
+    std::vector<unsigned char> payload(assembly.payload_size);
+    for (size_t i = 0; i < assembly.k; ++i) {
+        const size_t offset = i * assembly.shard_size;
+        const size_t count = offset < assembly.payload_size ?
+                std::min<size_t>(assembly.shard_size,
+                    assembly.payload_size - offset) : 0;
+        if (count) memcpy(payload.data() + offset, shard_ptrs[i], count);
+    }
+    for (auto ptr: shard_ptrs) free(ptr);
+
+    std::vector<uint256_t> final_cmds;
+    final_cmds.reserve(assembly.cmd_count);
+    for (size_t offset = 0; offset < payload.size(); offset += sizeof(uint256_t))
+        final_cmds.emplace_back(payload.data() + offset);
+    std::vector<block_t> parents;
+    for (const auto &parent_hash: assembly.template_blk->get_parent_hashes()) {
+        block_t parent = storage->find_blk(parent_hash);
+        if (!parent) return false;
+        parents.push_back(parent);
+    }
+    block_t qc_ref = storage->find_blk(assembly.template_blk->get_qc_ref_hash());
+    if (assembly.template_blk->get_qc() && !qc_ref) return false;
+    block_t origin_blk = storage->add_blk(new Block(parents, final_cmds,
+                assembly.template_blk->get_qc() ?
+                    assembly.template_blk->get_qc()->clone() : nullptr,
+                bytearray_t(assembly.template_blk->get_extra()),
+                assembly.template_blk->get_height(), qc_ref, nullptr));
+    if (origin_blk->get_hash() != origin_hash) {
+        block_t known = storage->find_blk(origin_hash);
+        LOG_WARN("dropping erasure proposal with mismatched original hash expected=%s actual=%s cmd0=%s known=%d known_cmd0=%s parents=%lu extra=%lu",
+                get_hex10(origin_hash).c_str(),
+                get_hex10(origin_blk->get_hash()).c_str(),
+                final_cmds.empty() ? "none" : get_hex10(final_cmds[0]).c_str(),
+                known ? 1 : 0,
+                (!known || known->get_cmds().empty()) ? "none" :
+                    get_hex10(known->get_cmds()[0]).c_str(),
+                parents.size(), assembly.template_blk->get_extra().size());
+        erasure_assemblies.erase(origin_hash);
+        return false;
+    }
+    Proposal complete(assembly.proposer, origin_blk, nullptr);
+    erasure_assemblies.erase(origin_hash);
+    completed_erasure.insert(origin_hash);
+    HOTSTUFF_LOG_INFO("erasure_reconstructed: origin=%s shards=%u",
+            get_hex10(origin_hash).c_str(), prop.erasure_k);
+    promise::all(std::vector<promise_t>{async_deliver_blk(origin_hash, peer)})
+        .then([this, complete = std::move(complete)]() {
+            on_receive_proposal(complete);
+        });
+    return true;
 }
 
-/**
- * Retrieve the data of a specific part for a given block hash.
- * Throws an exception if the block hash or part is invalid.
- */
-
-std::vector<uint256_t> HotStuffBase::get_cmd_part(const uint256_t &blk_hash, size_t part) const {
-    if (cmd_storage.find(blk_hash) != cmd_storage.end() && part < 2) {
-        return cmd_storage.at(blk_hash)[part];
-    }
-    throw std::runtime_error("Block hash or part index invalid.");
-}
-
-/**
- * Check if all parts of the command data for a given block hash are complete.
- * Returns true if both parts have been received, false otherwise.
- */
-bool HotStuffBase::is_cmd_complete(const uint256_t &blk_hash) const {
-    if (cmd_storage.find(blk_hash) == cmd_storage.end()) return false;
-
-    // Check if both parts have been received
-    const auto &parts = cmd_storage.at(blk_hash);
-    return !parts[0].empty() && !parts[1].empty();
+size_t HotStuffBase::erasure_send_copies() const {
+    const char *env = std::getenv("HOTSTUFF_ERASURE_SEND_COPIES");
+    if (!env || !*env) return 1;
+    char *end = nullptr;
+    unsigned long value = std::strtoul(env, &end, 10);
+    if (*end != '\0' || value == 0 || value > 10)
+        throw HotStuffError("invalid HOTSTUFF_ERASURE_SEND_COPIES=%s", env);
+    return static_cast<size_t>(value);
 }
 
 void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
@@ -310,109 +433,22 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         return;
     }
 
-    uint256_t blk_hash = prop.erasure_origin_hash;
-    std::vector<uint256_t> cmd = blk->get_cmds();
-    if (cmd.empty() || prop.erasure_part >= 2) return;
+    const uint256_t origin_hash = prop.erasure_origin_hash;
+    if (!accept_erasure_fragment(Proposal(prop), peer, true)) return;
+    if (forwarded_erasure.insert(origin_hash).second)
+        broadcast_reproposal(prop);
+}
 
-    add_cmd_storage(blk_hash, cmd, prop.erasure_part);
-
-    if (!is_cmd_complete(blk_hash)) return;
-
-    const size_t CHUNK_SIZE = 8192;
-    const size_t TOTAL_CHUNKS = 128;
-    unsigned char *buffs[TOTAL_CHUNKS] = {nullptr};
-
-    for (size_t i = 0; i < TOTAL_CHUNKS; ++i) {
-        void *buf;
-        if (posix_memalign(&buf, 64, CHUNK_SIZE)) {
-            for (size_t j = 0; j < i; ++j) free(buffs[j]);
-            return;
-        }
-        buffs[i] = static_cast<unsigned char *>(buf);
-        memset(buffs[i], 0, CHUNK_SIZE);
-    }
-
-    std::vector<uint256_t> cmda = get_cmd_part(blk_hash, 0);
-    std::vector<uint256_t> cmdb = get_cmd_part(blk_hash, 1);
-    if (cmda.empty() || cmdb.empty()) return;
-    cmda.erase(cmda.begin());
-    cmdb.erase(cmdb.begin());
-
-    size_t cmds_size = cmda.size() * sizeof(uint256_t);
-    std::vector<unsigned char> cmda_char(cmds_size), cmdb_char(cmdb.size() * sizeof(uint256_t));
-
-    for (size_t i = 0; i < cmda.size(); ++i)
-        memcpy(&cmda_char[i * sizeof(uint256_t)], &cmda[i], sizeof(uint256_t));
-    for (size_t i = 0; i < cmdb.size(); ++i)
-        memcpy(&cmdb_char[i * sizeof(uint256_t)], &cmdb[i], sizeof(uint256_t));
-
-    size_t total_chunks = (cmda_char.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    if (total_chunks == 0 || 2 * total_chunks > TOTAL_CHUNKS) return;
-    for (size_t i = 0; i < total_chunks; ++i) {
-        size_t start_index = i * CHUNK_SIZE;
-        size_t end_index = std::min(start_index + CHUNK_SIZE, cmda_char.size());
-        std::copy(cmda_char.begin() + start_index, cmda_char.begin() + end_index, buffs[i]);
-    }
-    for (size_t i = 0; i < total_chunks; ++i) {
-        size_t start_index = i * CHUNK_SIZE;
-        size_t end_index = std::min(start_index + CHUNK_SIZE, cmdb_char.size());
-        std::copy(cmdb_char.begin() + start_index, cmdb_char.begin() + end_index, buffs[total_chunks + i]);
-    }
-
-    size_t m = 2 * total_chunks;
-    unsigned char *temp_buffs[TOTAL_CHUNKS] = {nullptr};
-    unsigned char src_in_err[TOTAL_CHUNKS] = {0};
-    unsigned char src_err_list[TOTAL_CHUNKS] = {0};
-    src_in_err[0] = 1;
-    src_err_list[0] = 0;
-
-    for (size_t i = 0; i < TOTAL_CHUNKS; ++i) {
-        void *buf;
-        if (posix_memalign(&buf, 64, CHUNK_SIZE)) {
-            for (size_t j = 0; j < i; ++j) free(temp_buffs[j]);
-            for (size_t j = 0; j < TOTAL_CHUNKS; ++j) free(buffs[j]);
-            return;
-        }
-        temp_buffs[i] = static_cast<unsigned char *>(buf);
-        memset(temp_buffs[i], 0, CHUNK_SIZE);
-    }
-
-    decode_function((int)m, (int)total_chunks, buffs, src_in_err, src_err_list, 1, 1, temp_buffs);
-
-    std::vector<uint256_t> final_cmds;
-    for (size_t i = 0, j = 0; i < total_chunks; ++i) {
-        unsigned char *chunk_ptr = (j < 1 && i == src_err_list[j]) ? temp_buffs[total_chunks + j++] : buffs[i];
-        for (size_t offset = 0; offset < CHUNK_SIZE; offset += sizeof(uint256_t)) {
-            uint256_t value;
-            memcpy(&value, chunk_ptr + offset, sizeof(uint256_t));
-            final_cmds.push_back(value);
-        }
-    }
-    if (final_cmds.size() > prop.erasure_cmd_count)
-        final_cmds.resize(prop.erasure_cmd_count);
-
-    block_t origin_blk = storage->add_blk(
-        new Block(blk->get_parents(), final_cmds,
-            blk->get_qc() ? blk->get_qc()->clone() : nullptr,
-            bytearray_t(blk->get_extra()),
-            blk->get_height(),
-            blk->get_qc_ref(),
-            nullptr));
-    if (origin_blk->get_hash() != blk_hash) {
-        LOG_WARN("dropping erasure proposal with mismatched original hash");
+void HotStuffBase::repropose_handler(MsgRepropose &&msg, const Net::conn_t &conn) {
+    const NetAddr &peer = conn->get_peer_addr();
+    if (peer.is_null()) return;
+    msg.postponed_parse(this);
+    if (should_drop_proposal()) {
+        LOG_WARN("dropping re-proposal due to HOTSTUFF_DROP_PROPOSE_PCT=%d",
+                get_drop_propose_pct());
         return;
     }
-
-    prop.blk = origin_blk;
-    cmd_storage.erase(blk_hash);
-
-    promise::all(std::vector<promise_t> {async_deliver_blk(blk_hash, peer)})
-        .then([this, prop = std::move(prop)]() { on_receive_proposal(prop); });
-
-    for (size_t i = 0; i < TOTAL_CHUNKS; ++i) {
-        if (buffs[i]) free(buffs[i]);
-        if (temp_buffs[i]) free(temp_buffs[i]);
-    }
+    accept_erasure_fragment(std::move(msg.proposal), peer, false);
 }
 
 void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
@@ -421,6 +457,11 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     msg.postponed_parse(this);
     //auto &vote = msg.vote;
     RcObj<Vote> v(new Vote(std::move(msg.vote)));
+    if (require_erasure_reconstruction() &&
+            !storage->is_blk_fetched(v->blk_hash)) {
+        LOG_WARN("dropping vote for block not reconstructed from erasure shards");
+        return;
+    }
     promise::all(std::vector<promise_t>{
         async_deliver_blk(v->blk_hash, peer),
         v->verify(vpool),
@@ -665,6 +706,7 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
 {
     /* register the handlers for msg from replicas */
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::propose_handler, this, _1, _2));
+    pn.reg_handler(salticidae::generic_bind(&HotStuffBase::repropose_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::vote_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::notify_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::blame_handler, this, _1, _2));

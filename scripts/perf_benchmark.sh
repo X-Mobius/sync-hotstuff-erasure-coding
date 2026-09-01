@@ -16,6 +16,9 @@ DROP_PROPOSE_PCT="${DROP_PROPOSE_PCT:-0}"
 NFAULTY="${NFAULTY:-}"
 IMPLEMENTATION="${IMPLEMENTATION:-unknown}"
 SCENARIO="${SCENARIO:-custom}"
+REQUIRE_ERASURE="${REQUIRE_ERASURE:-0}"
+BLOCK_SIZE="${BLOCK_SIZE:-1}"
+ERASURE_SEND_COPIES="${ERASURE_SEND_COPIES:-1}"
 RESUME="${RESUME:-0}"
 
 mkdir -p "$OUT_DIR"
@@ -27,7 +30,7 @@ if pgrep -f "hotstuff-app --conf" >/dev/null 2>&1; then
     exit 1
 fi
 
-HEADER="implementation,scenario,nfaulty,quorum,configured_nodes,active_nodes,drop_propose_pct,repeat,async,client_seconds,confirmed,max_height,avg_latency_s,min_latency_s,p50_latency_s,p95_latency_s,max_latency_s,throughput_ops_s,client_rc,replica_sent_msgs,replica_recv_msgs,proposal_wire_bytes,proposal_bytes_per_confirmed,max_decided,live"
+HEADER="implementation,scenario,nfaulty,quorum,configured_nodes,active_nodes,drop_propose_pct,repeat,async,block_size,erasure_send_copies,client_seconds,confirmed,max_height,avg_latency_s,min_latency_s,p50_latency_s,p95_latency_s,max_latency_s,throughput_ops_s,client_rc,replica_sent_msgs,replica_recv_msgs,proposal_wire_bytes,proposal_direct_wire_bytes,reproposal_wire_bytes,proposal_bytes_per_confirmed,erasure_reconstructed,erasure_hash_failures,max_decided,live"
 if [[ "$RESUME" != 1 || ! -s "$SUMMARY_CSV" ]]; then
     echo "$HEADER" > "$SUMMARY_CSV"
 elif [[ "$(head -n 1 "$SUMMARY_CSV")" != "$HEADER" ]]; then
@@ -52,6 +55,8 @@ run_one() {
     for replica in $REPLICAS; do
         HOTSTUFF_DROP_PROPOSE_PCT="$DROP_PROPOSE_PCT" \
         HOTSTUFF_NFAULTY="$NFAULTY" \
+        HOTSTUFF_REQUIRE_ERASURE_RECONSTRUCTION="$REQUIRE_ERASURE" \
+        HOTSTUFF_ERASURE_SEND_COPIES="$ERASURE_SEND_COPIES" \
         "$ROOT_DIR/examples/hotstuff-app" --conf "${APP_CONF_PREFIX}${replica}.conf" \
             > "$run_dir/replica${replica}.log" 2>&1 &
         pids+=("$!")
@@ -81,17 +86,21 @@ run_one() {
 
     python3 - "$run_dir" "$SUMMARY_CSV" "$IMPLEMENTATION" "$SCENARIO" \
         "$NFAULTY" "$REPLICAS" "$DROP_PROPOSE_PCT" "$repeat" "$async" \
-        "$CLIENT_SECONDS" "$client_rc" "$start_epoch" "$end_epoch" <<'PY'
+        "$BLOCK_SIZE" "$ERASURE_SEND_COPIES" "$CLIENT_SECONDS" "$client_rc" "$start_epoch" "$end_epoch" <<'PY'
 import csv, pathlib, re, statistics, sys
 
 (run_dir_s, summary_s, implementation, scenario, nfaulty_s, replicas_s,
- drop_s, repeat_s, async_s, seconds_s, rc_s, start_s, end_s) = sys.argv[1:]
+ drop_s, repeat_s, async_s, block_size_s, copies_s, seconds_s, rc_s, start_s, end_s) = sys.argv[1:]
 run_dir, summary = pathlib.Path(run_dir_s), pathlib.Path(summary_s)
 fin_re = re.compile(r"got <fin .*?cmd_height=(\d+).*?wall: ([0-9.]+)")
 sent_re = re.compile(r"\[hotstuff info\] sent: (\d+)")
 recv_re = re.compile(r"\[hotstuff info\] recv: (\d+)")
 decided_re = re.compile(r"\[hotstuff info\] decided: (\d+)")
-proposal_re = re.compile(r"proposal_wire_bytes: (\d+)")
+proposal_re = re.compile(r"\] proposal_wire_bytes: (\d+)")
+proposal_direct_re = re.compile(r"proposal_direct_wire_bytes: (\d+)")
+reproposal_re = re.compile(r"reproposal_wire_bytes: (\d+)")
+reconstructed_re = re.compile(r"erasure_reconstructed:")
+hash_failure_re = re.compile(r"mismatched original hash")
 config_re = re.compile(r"benchmark_config replicas=(\d+) nfaulty=(\d+) quorum=(\d+)")
 
 latencies, heights = [], []
@@ -106,7 +115,8 @@ def percentile(values, pct):
     ordered = sorted(values)
     return ordered[int(round((pct / 100) * (len(ordered) - 1)))]
 
-sent = recv = decided = proposal_bytes = configured = quorum = 0
+sent = recv = decided = proposal_bytes = direct_bytes = reproposal_bytes = 0
+reconstructed = hash_failures = configured = quorum = 0
 for path in sorted(run_dir.glob("replica*.log")):
     text = path.read_text(errors="replace")
     vals = [int(x) for x in sent_re.findall(text)]
@@ -116,6 +126,10 @@ for path in sorted(run_dir.glob("replica*.log")):
     vals = [int(x) for x in decided_re.findall(text)]
     decided = max([decided] + vals)
     proposal_bytes += sum(int(x) for x in proposal_re.findall(text))
+    direct_bytes += sum(int(x) for x in proposal_direct_re.findall(text))
+    reproposal_bytes += sum(int(x) for x in reproposal_re.findall(text))
+    reconstructed += len(reconstructed_re.findall(text))
+    hash_failures += len(hash_failure_re.findall(text))
     match = config_re.search(text)
     if match:
         configured, quorum = int(match.group(1)), int(match.group(3))
@@ -127,6 +141,8 @@ row = {
     "nfaulty": nfaulty_s, "quorum": quorum,
     "configured_nodes": configured, "active_nodes": len(replicas_s.split()),
     "drop_propose_pct": drop_s, "repeat": repeat_s, "async": async_s,
+    "block_size": block_size_s,
+    "erasure_send_copies": copies_s,
     "client_seconds": seconds_s, "confirmed": confirmed,
     "max_height": max(heights) if heights else 0,
     "avg_latency_s": f"{statistics.mean(latencies):.6f}" if latencies else "0.000000",
@@ -137,7 +153,11 @@ row = {
     "throughput_ops_s": f"{confirmed / elapsed:.6f}", "client_rc": rc_s,
     "replica_sent_msgs": sent, "replica_recv_msgs": recv,
     "proposal_wire_bytes": proposal_bytes,
+    "proposal_direct_wire_bytes": direct_bytes,
+    "reproposal_wire_bytes": reproposal_bytes,
     "proposal_bytes_per_confirmed": f"{proposal_bytes / confirmed:.3f}" if confirmed else "0.000",
+    "erasure_reconstructed": reconstructed,
+    "erasure_hash_failures": hash_failures,
     "max_decided": decided, "live": int(confirmed > 0),
 }
 with summary.open("a", newline="") as handle:

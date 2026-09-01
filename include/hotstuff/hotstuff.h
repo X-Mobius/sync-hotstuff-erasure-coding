@@ -50,6 +50,16 @@ struct MsgPropose {
     void postponed_parse(HotStuffCore *hsc);
 };
 
+/** Replica-to-replica forwarding of one erasure-coded proposal shard. */
+struct MsgRepropose {
+    static const opcode_t opcode = 0x7;
+    DataStream serialized;
+    Proposal proposal;
+    MsgRepropose(const Proposal &);
+    MsgRepropose(DataStream &&s): serialized(std::move(s)) {}
+    void postponed_parse(HotStuffCore *hsc);
+};
+
 struct MsgVote {
     static const opcode_t opcode = 0x1;
     DataStream serialized;
@@ -188,8 +198,23 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
-    /* New command storage map 新加的*/
-    std::unordered_map<uint256_t, std::vector<std::vector<uint256_t>>> cmd_storage;
+    struct ErasureAssembly {
+        ReplicaID proposer;
+        uint16_t n;
+        uint16_t k;
+        uint32_t shard_size;
+        uint32_t payload_size;
+        uint32_t cmd_count;
+        block_t template_blk;
+        std::vector<std::vector<unsigned char>> shards;
+        std::vector<unsigned char> present;
+        size_t received;
+        ErasureAssembly(): proposer(0), n(0), k(0), shard_size(0),
+            payload_size(0), cmd_count(0), template_blk(nullptr), received(0) {}
+    };
+    std::unordered_map<uint256_t, ErasureAssembly> erasure_assemblies;
+    std::unordered_set<uint256_t> forwarded_erasure;
+    std::unordered_set<uint256_t> completed_erasure;
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::queue<uint256_t> cmd_pending_buffer;
@@ -237,6 +262,7 @@ class HotStuffBase: public HotStuffCore {
 
     /** deliver consensus message: <propose> */
     inline void propose_handler(MsgPropose &&, const Net::conn_t &);
+    inline void repropose_handler(MsgRepropose &&, const Net::conn_t &);
     /** deliver consensus message: <vote> */
     inline void vote_handler(MsgVote &&, const Net::conn_t &);
     inline void notify_handler(MsgNotify &&, const Net::conn_t &);
@@ -249,6 +275,7 @@ class HotStuffBase: public HotStuffCore {
     inline void resp_blk_handler(MsgRespBlock &&, const Net::conn_t &);
 
     inline bool conn_handler(const salticidae::ConnPool::conn_t &, bool);
+    size_t erasure_send_copies() const;
     template<typename T, typename M>
     void _do_broadcast(const T &t) {
         //M m(t);
@@ -264,24 +291,33 @@ class HotStuffBase: public HotStuffCore {
         pn.multicast_msg(std::move(msg), peers);
     }
 
-    template<typename T, typename M>
-    void _send_to_two_replicas(const T &prop1, const T &prop2) {
-        if (peers.size() < 2) {
-            throw std::runtime_error("Not enough peers to send messages to two replicas.");
-        }
-
-        // Send both encoded parts to every replica. This keeps the stock demo
-        // path live until the Re-propose forwarding step is implemented.
-        M msg1(prop1);
-        M msg2(prop2);
-        HOTSTUFF_LOG_INFO("proposal_wire_bytes: %lu",
-                (msg1.serialized.size() + msg2.serialized.size()) * peers.size());
-        pn.multicast_msg(std::move(msg1), peers);
-        pn.multicast_msg(std::move(msg2), peers);
+    void broadcast_reproposal(const Proposal &prop) {
+        MsgRepropose sample(prop);
+        const size_t copies = erasure_send_copies();
+        const size_t bytes = sample.serialized.size() * peers.size() * copies;
+        HOTSTUFF_LOG_INFO("reproposal_wire_bytes: %lu", bytes);
+        HOTSTUFF_LOG_INFO("proposal_wire_bytes: %lu", bytes);
+        for (size_t i = 0; i < copies; ++i)
+            pn.multicast_msg(MsgRepropose(prop), peers);
     }
 
-    void do_broadcast_proposal_to_replica(const Proposal &prop1, const Proposal &prop2) override {
-        _send_to_two_replicas<Proposal, MsgPropose>(prop1, prop2);
+    void do_send_erasure_proposals(const std::vector<Proposal> &proposals) override {
+        if (proposals.size() != get_config().nreplicas)
+            throw std::runtime_error("erasure proposal count does not match replicas");
+        for (ReplicaID rid = 0; rid < proposals.size(); ++rid) {
+            const Proposal &prop = proposals[rid];
+            if (rid == get_id()) {
+                broadcast_reproposal(prop);
+                continue;
+            }
+            MsgPropose sample(prop);
+            const size_t copies = erasure_send_copies();
+            const size_t bytes = sample.serialized.size() * copies;
+            HOTSTUFF_LOG_INFO("proposal_direct_wire_bytes: %lu", bytes);
+            HOTSTUFF_LOG_INFO("proposal_wire_bytes: %lu", bytes);
+            for (size_t i = 0; i < copies; ++i)
+                pn.send_msg(MsgPropose(prop), get_config().get_addr(rid));
+        }
     }
 
     void do_broadcast_vote(const Vote &vote) override {
@@ -358,10 +394,8 @@ class HotStuffBase: public HotStuffCore {
     virtual void do_demand_commands(size_t) {}
 #endif
 
-    // Methods for managing cmd_storage 新加
-    void add_cmd_storage(const uint256_t &blk_hash, const std::vector<uint256_t> &data, size_t part);
-    std::vector<uint256_t> get_cmd_part(const uint256_t &blk_hash, size_t part) const;
-    bool is_cmd_complete(const uint256_t &blk_hash) const;
+    bool accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
+                                 bool directed);
 
     /* Helper functions */
     /** Returns a promise resolved (with command_t cmd) when Command is fetched. */
