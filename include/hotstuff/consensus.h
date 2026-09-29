@@ -19,6 +19,8 @@
 #define _HOTSTUFF_CONSENSUS_H
 
 #include <cassert>
+#include <mutex>
+#include "hotstuff/command_batch.h"
 #include <set>
 #include <unordered_map>
 
@@ -85,10 +87,45 @@ class HotStuffCore {
     void _new_view();
 
     protected:
+    std::mutex command_mutex;
+    std::unordered_map<uint256_t, bytearray_t> command_bodies;
+    size_t command_bytes = 0;
+    std::unordered_set<uint256_t> reconstructed_commands;
+    virtual bool validate_command_body(const bytearray_t &) { return false; }
     ReplicaID id;                  /**< identity of the replica itself */
 
     public:
     BoxObj<EntityStorage> storage;
+    void remember_command(const uint256_t &hash, const bytearray_t &bytes) {
+        if (!full_commands()) return;
+        DataStream s(bytes);
+        if(bytes.size()>MAX_COMMAND_BYTES || s.get_hash()!=hash || !validate_command_body(bytes))
+            throw std::runtime_error("invalid command body");
+        std::lock_guard<std::mutex> lock(command_mutex);
+        auto it=command_bodies.find(hash);
+        if(it!=command_bodies.end()) {
+            if(it->second!=bytes) throw std::runtime_error("command conflict");
+            return;
+        }
+        if(command_bytes+bytes.size()>128*1024*1024 || command_bodies.size()>=8192)
+            throw std::runtime_error("command cache limit");
+        command_bodies.emplace(hash,bytes); command_bytes+=bytes.size();
+    }
+    void forget_command(const uint256_t &hash) {
+        std::lock_guard<std::mutex> lock(command_mutex);
+        auto it=command_bodies.find(hash);
+        if(it!=command_bodies.end()) { command_bytes-=it->second.size(); command_bodies.erase(it); }
+    }
+    bytearray_t make_command_batch(const std::vector<uint256_t> &hashes) {
+        std::lock_guard<std::mutex> lock(command_mutex);
+        std::vector<bytearray_t> bodies;
+        for(const auto &h: hashes) {
+            auto it=command_bodies.find(h);
+            if(it==command_bodies.end()) throw std::runtime_error("leader missing command body");
+            bodies.push_back(it->second);
+        }
+        return encode_command_batch(bodies);
+    }
 
     HotStuffCore(ReplicaID id, privkey_bt &&priv_key);
     virtual ~HotStuffCore() {
@@ -228,6 +265,21 @@ struct Proposal: public Serializable {
     uint32_t erasure_payload_size;
     uint32_t erasure_cmd_count;
     uint256_t erasure_origin_hash;
+    bool full_body = false;
+    bool full_broadcast = false;
+    uint32_t body_view = 0, body_height = 0;
+    uint256_t payload_hash;
+    bytearray_t body_shard;
+    part_cert_bt leader_cert;
+    uint256_t body_commitment() const {
+        DataStream s;
+        s << uint8_t(full_broadcast ? 0x43 : 0x42)
+          << proposer << htole(body_view) << htole(body_height)
+          << htole(erasure_n) << htole(erasure_k) << htole(erasure_part)
+          << htole(erasure_shard_size) << htole(erasure_payload_size)
+          << htole(erasure_cmd_count) << erasure_origin_hash << payload_hash << *blk << body_shard;
+        return s.get_hash();
+    }
 
     Proposal():
         blk(nullptr), hsc(nullptr), is_erasure_part(false),
@@ -252,11 +304,16 @@ struct Proposal: public Serializable {
         erasure_shard_size(other.erasure_shard_size),
         erasure_payload_size(other.erasure_payload_size),
         erasure_cmd_count(other.erasure_cmd_count),
-        erasure_origin_hash(other.erasure_origin_hash) {}
+        erasure_origin_hash(other.erasure_origin_hash), full_body(other.full_body),
+        full_broadcast(other.full_broadcast),
+        body_view(other.body_view), body_height(other.body_height), payload_hash(other.payload_hash),
+        body_shard(other.body_shard), leader_cert(other.leader_cert ? other.leader_cert->clone() : nullptr) {}
 
     void serialize(DataStream &s) const override {
+        if (full_broadcast && (!full_body || !is_erasure_part))
+            throw std::runtime_error("invalid full broadcast proposal state");
         s << proposer
-          << (uint8_t)(is_erasure_part ? 1 : 0);
+          << (uint8_t)(full_broadcast ? 3 : (full_body ? 2 : (is_erasure_part ? 1 : 0)));
         if (is_erasure_part)
             s << htole(erasure_part)
               << htole(erasure_n)
@@ -265,7 +322,9 @@ struct Proposal: public Serializable {
               << htole(erasure_payload_size)
               << htole(erasure_cmd_count)
               << erasure_origin_hash;
+        if(full_body) s << htole(body_view) << htole(body_height) << payload_hash;
         s << *blk;
+        if(full_body) s << body_shard << *leader_cert;
     }
 
     inline void unserialize(DataStream &s) override;
@@ -529,6 +588,11 @@ inline void Proposal::unserialize(DataStream &s) {
     assert(hsc != nullptr);
     uint8_t flag;
     s >> proposer >> flag;
+    if(flag>3) throw std::runtime_error("proposal format flag");
+    full_broadcast = flag == 3;
+    full_body = flag >= 2;
+    if(full_body && full_broadcast != benchmark_full_broadcast())
+        throw std::runtime_error("proposal distribution mode mismatch");
     is_erasure_part = flag != 0;
     if (is_erasure_part)
     {
@@ -552,9 +616,27 @@ inline void Proposal::unserialize(DataStream &s) {
         erasure_cmd_count = 0;
         erasure_origin_hash = uint256_t();
     }
+    if(full_body) {
+        if(!full_commands() || erasure_n==0 || erasure_n>32 || erasure_k==0 || erasure_k>erasure_n ||
+                erasure_part>=erasure_n || erasure_cmd_count>MAX_BATCH_COMMANDS ||
+                erasure_payload_size<8 || erasure_payload_size>MAX_BATCH_BYTES ||
+                erasure_shard_size==0 || erasure_shard_size>MAX_BATCH_BYTES ||
+                uint64_t(erasure_shard_size)*erasure_n>64*1024*1024 ||
+                uint64_t(erasure_shard_size)*erasure_k<erasure_payload_size)
+            throw std::runtime_error("full proposal limits");
+        s >> body_view >> body_height >> payload_hash;
+        body_view=letoh(body_view); body_height=letoh(body_height);
+    }
     Block _blk;
     _blk.unserialize(s, hsc);
-    blk = hsc->storage->add_blk(std::move(_blk), hsc->get_config());
+    if(full_body) {
+        if(erasure_shard_size>s.size()) throw std::runtime_error("truncated shard");
+        const auto *p=s.get_data_inplace(erasure_shard_size);
+        body_shard.assign(p,p+erasure_shard_size);
+        leader_cert=hsc->parse_part_cert(s);
+        if(s.size()) throw std::runtime_error("proposal trailing bytes");
+    }
+    blk = full_body ? block_t(new Block(std::move(_blk))) : hsc->storage->add_blk(std::move(_blk), hsc->get_config());
 }
 
 struct Finality: public Serializable {

@@ -1,0 +1,17 @@
+diff --git a/include/salticidae/event.h b/include/salticidae/event.h
+index 2f22e1a..80dfd73 100644
+--- a/include/salticidae/event.h
++++ b/include/salticidae/event.h
+@@ -41 +41,11 @@ namespace salticidae {
+-static void _on_uv_handle_close(uv_handle_t *h) { if (h) delete h; }
++static void _on_uv_handle_close(uv_handle_t *h) {
++    if (!h) return;
++    // libuv exposes a common prefix, not a C++ polymorphic base class.
++    switch (h->type) {
++        case UV_POLL: delete reinterpret_cast<uv_poll_t *>(h); break;
++        case UV_TIMER: delete reinterpret_cast<uv_timer_t *>(h); break;
++        case UV_SIGNAL: delete reinterpret_cast<uv_signal_t *>(h); break;
++        case UV_CHECK: delete reinterpret_cast<uv_check_t *>(h); break;
++        default: ::operator delete(static_cast<void *>(h)); break;
++    }
++}

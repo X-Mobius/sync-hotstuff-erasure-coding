@@ -419,6 +419,10 @@ class QuorumCertSecp256k1: public QuorumCert {
     }
 
     void unserialize(DataStream &s) override {
+        if(s.size()<36) throw std::runtime_error("truncated QC header");
+        DataStream prefix(s.data()+32,s.data()+36);
+        uint32_t count; prefix >> count;
+        if(letoh(count)>32) throw std::runtime_error("QC replica limit");
         s >> obj_hash >> rids;
         for (size_t i = 0; i < rids.size(); i++)
             if (rids.get(i)) s >> sigs[i];

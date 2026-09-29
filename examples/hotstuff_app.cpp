@@ -94,8 +94,15 @@ class HotStuffApp: public HotStuff {
 
     void client_request_cmd_handler(MsgReqCmd &&, const conn_t &);
 
+    bool validate_command_body(const hotstuff::bytearray_t &bytes) override {
+        try {
+            DataStream s(bytes); CommandDummy cmd; s >> cmd;
+            DataStream out; out << cmd;
+            return !s.size() && hotstuff::stream_bytes(out)==bytes;
+        } catch(const std::exception &) { return false; }
+    }
     static command_t parse_cmd(DataStream &s) {
-        auto cmd = new CommandDummy();
+        command_t cmd = new CommandDummy();
         s >> *cmd;
         return cmd;
     }
@@ -337,18 +344,29 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
 
     /* register the handlers for msg from clients */
     cn.reg_handler(salticidae::generic_bind(&HotStuffApp::client_request_cmd_handler, this, _1, _2));
+    cn.reg_handler([this](hotstuff::MsgWatchCmd &&msg, const conn_t &conn) {
+        const NetAddr addr=conn->get_addr();
+        exec_command(msg.hash,[this,addr](Finality fin) { resp_queue.enqueue(std::make_pair(fin,addr)); });
+    });
     cn.start();
     cn.listen(clisten_addr);
 }
 
 void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn) {
+    try {
     const NetAddr addr = conn->get_addr();
+    if(hotstuff::full_commands()) HOTSTUFF_LOG_INFO("body_client_received: %lu",msg.serialized.size());
     auto cmd = parse_cmd(msg.serialized);
     const auto &cmd_hash = cmd->get_hash();
     HOTSTUFF_LOG_DEBUG("processing %s", std::string(*cmd).c_str());
+    DataStream body; body << *cmd;
+    remember_command(cmd_hash, hotstuff::stream_bytes(body));
     exec_command(cmd_hash, [this, addr](Finality fin) {
         resp_queue.enqueue(std::make_pair(fin, addr));
     });
+    } catch(const std::exception &e) {
+        HOTSTUFF_LOG_WARN("command_request_rejected: %s",e.what());
+    }
 }
 
 void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps,

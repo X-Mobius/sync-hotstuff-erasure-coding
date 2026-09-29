@@ -27,3 +27,8 @@ include/hotstuff/config.h
 /log1
 /log2
 core
+
+/test/test_command_batch
+/test/test_full_proposal
+/test/test_full_command_state
+/scripts/__pycache__/

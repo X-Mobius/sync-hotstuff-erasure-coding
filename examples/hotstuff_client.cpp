@@ -52,9 +52,9 @@ uint32_t nfaulty;
 
 struct Request {
     command_t cmd;
-    size_t confirmed;
+    std::unordered_set<ReplicaID> acknowledged;
     salticidae::ElapsedTime et;
-    Request(const command_t &cmd): cmd(cmd), confirmed(0) { et.start(); }
+    Request(const command_t &cmd): cmd(cmd) { et.start(); }
 };
 
 using Net = salticidae::MsgNetwork<opcode_t>;
@@ -75,7 +75,18 @@ bool try_send(bool check = true) {
     {
         auto cmd = new CommandDummy(cid, cnt++);
         MsgReqCmd msg(*cmd);
-        for (auto &p: conns) mn.send_msg(msg, p.second);
+        for (auto &p: conns) {
+            if(hotstuff::strict_commands()) {
+                const char *leader=std::getenv("HOTSTUFF_CLIENT_LEADER");
+                if(!leader) throw std::runtime_error("strict client requires stable leader configuration");
+                if(p.first != std::stoul(leader)) {
+                    mn.send_msg(hotstuff::MsgWatchCmd(cmd->get_hash()),p.second);
+                    continue;
+                }
+            }
+            mn.send_msg(msg,p.second);
+            HOTSTUFF_LOG_INFO("client_body_bytes: %lu",msg.serialized.size());
+        }
 #ifndef HOTSTUFF_ENABLE_BENCHMARK
         HOTSTUFF_LOG_INFO("send new cmd %.10s",
                             get_hex(cmd->get_hash()).c_str());
@@ -94,10 +105,11 @@ void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
     const uint256_t &cmd_hash = fin.cmd_hash;
     auto it = waiting.find(cmd_hash);
-    auto &et = it->second.et;
     if (it == waiting.end()) return;
+    auto &et = it->second.et;
+    if(fin.decision!=1) return;
     et.stop();
-    if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
+    if (!it->second.acknowledged.insert(fin.rid).second || it->second.acknowledged.size() <= nfaulty) return; // wait for f + 1 ack
 #ifndef HOTSTUFF_ENABLE_BENCHMARK
     HOTSTUFF_LOG_INFO("got %s, wall: %.3f, cpu: %.3f",
                         std::string(fin).c_str(),
@@ -107,6 +119,7 @@ void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     gettimeofday(&tv, nullptr);
     elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
 #endif
+    HOTSTUFF_LOG_INFO("benchmark_confirmed hash=%s latency=%.9f",cmd_hash.to_hex().c_str(),et.elapsed_sec);
     waiting.erase(it);
 #if !defined(SYNCHS_AUTOCLI) || defined(SYNCHS_RESENDALL)
     while (try_send());

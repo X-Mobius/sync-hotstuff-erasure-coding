@@ -39,17 +39,20 @@ void Block::unserialize(DataStream &s, HotStuffCore *hsc) {
     uint8_t flag;
     s >> n;
     n = letoh(n);
+    if(n>32 || uint64_t(n)*32>s.size()) throw std::runtime_error("parent limit");
     parent_hashes.resize(n);
     for (auto &hash: parent_hashes)
         s >> hash;
     s >> n;
     n = letoh(n);
+    if(n>(full_commands()?MAX_BATCH_COMMANDS:262144) || uint64_t(n)*32>s.size()) throw std::runtime_error("block command limit");
     cmds.resize(n);
     for (auto &cmd: cmds)
         s >> cmd;
 //    for (auto &cmd: cmds)
 //        cmd = hsc->parse_cmd(s);
     s >> flag;
+    if(flag>1) throw std::runtime_error("noncanonical QC flag");
     if (flag)
     {
         qc = hsc->parse_quorum_cert(s);
@@ -57,6 +60,7 @@ void Block::unserialize(DataStream &s, HotStuffCore *hsc) {
     } else qc = nullptr;
     s >> n;
     n = letoh(n);
+    if(n>MAX_BATCH_BYTES || n>s.size()) throw std::runtime_error("extra limit");
     if (n == 0)
         extra.clear();
     else

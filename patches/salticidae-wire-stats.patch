@@ -1,0 +1,11 @@
+diff --git a/include/salticidae/network.h b/include/salticidae/network.h
+index f664493..d929355 100644
+--- a/include/salticidae/network.h
++++ b/include/salticidae/network.h
+@@ -597 +597,5 @@ inline bool MsgNetwork<OpcodeType>::_send_msg(const Msg &msg, const conn_t &conn
+-    return conn->write(std::move(msg_data));
++    const size_t wire_bytes=msg_data.size();
++    const bool accepted=conn->write(std::move(msg_data));
++    if(accepted && std::getenv("HOTSTUFF_WIRE_STATS"))
++        SALTICIDAE_LOG_INFO("wire_tx opcode=%u bytes=%lu",unsigned(msg.get_opcode()),wire_bytes);
++    return accepted;

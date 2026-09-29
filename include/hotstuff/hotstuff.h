@@ -19,6 +19,7 @@
 #define _HOTSTUFF_CORE_H
 
 #include <queue>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -198,6 +199,18 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
+    struct BodyAssembly {
+        explicit BodyAssembly(const Proposal &p): first(p) {}
+        Proposal first;
+        std::vector<bytearray_t> shards;
+        std::vector<unsigned char> present;
+        size_t count=0;
+        std::chrono::steady_clock::time_point created=std::chrono::steady_clock::now();
+    };
+    TimerEvent body_gc_timer;
+    std::unordered_map<uint256_t,BodyAssembly> body_assemblies;
+    std::unordered_map<uint256_t,uint32_t> body_completed;
+    bool accept_body_fragment(Proposal &prop, const NetAddr &peer, bool directed);
     struct ErasureAssembly {
         ReplicaID proposer;
         uint16_t n;
@@ -218,6 +231,8 @@ class HotStuffBase: public HotStuffCore {
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::queue<uint256_t> cmd_pending_buffer;
+    using body_queue_t = salticidae::MPSCQueueEventDriven<Proposal *>;
+    body_queue_t body_pending;
 
     /* statistics */
     uint64_t fetched;
@@ -292,6 +307,7 @@ class HotStuffBase: public HotStuffCore {
     }
 
     void broadcast_reproposal(const Proposal &prop) {
+        if(prop.full_broadcast) return;
         MsgRepropose sample(prop);
         const size_t copies = erasure_send_copies();
         const size_t bytes = sample.serialized.size() * peers.size() * copies;
@@ -307,7 +323,11 @@ class HotStuffBase: public HotStuffCore {
         for (ReplicaID rid = 0; rid < proposals.size(); ++rid) {
             const Proposal &prop = proposals[rid];
             if (rid == get_id()) {
-                broadcast_reproposal(prop);
+                if(prop.full_broadcast) body_pending.enqueue(new Proposal(prop));
+                else {
+                    if(prop.full_body) accept_erasure_fragment(Proposal(prop),get_config().get_addr(rid),true);
+                    broadcast_reproposal(prop);
+                }
                 continue;
             }
             MsgPropose sample(prop);
@@ -424,7 +444,7 @@ class HotStuff: public HotStuffBase {
     }
 
     part_cert_bt parse_part_cert(DataStream &s) override {
-        PartCert *pc = new PartCertType();
+        part_cert_bt pc(new PartCertType());
         s >> *pc;
         return pc;
     }
@@ -434,7 +454,7 @@ class HotStuff: public HotStuffBase {
     }
 
     quorum_cert_bt parse_quorum_cert(DataStream &s) override {
-        QuorumCert *qc = new QuorumCertType();
+        quorum_cert_bt qc(new QuorumCertType());
         s >> *qc;
         return qc;
     }
@@ -519,7 +539,7 @@ FetchContext<ent_type>::FetchContext(
 template<EntityType ent_type>
 void FetchContext<ent_type>::send(const NetAddr &replica_id) {
     hs->part_fetched_replica[replica_id]++;
-    hs->pn.send_msg(fetch_msg, replica_id);
+    if(!full_commands()) hs->pn.send_msg(fetch_msg, replica_id);
 }
 
 template<EntityType ent_type>

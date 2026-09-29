@@ -257,23 +257,139 @@ promise_t HotStuffBase::async_deliver_blk(const uint256_t &blk_hash,
         if (blk != get_genesis())
             pms.push_back(blk->verify(get_config(), vpool));
         promise::all(pms).then([this, blk]() {
-            on_deliver_blk(blk);
+            if(!storage->is_blk_delivered(blk->get_hash())) on_deliver_blk(blk);
         });
     });
     return static_cast<promise_t &>(pm);
 }
 
+
+bool HotStuffBase::accept_body_fragment(Proposal &prop, const NetAddr &peer, bool directed) {
+    const auto &cfg=get_config();
+    const auto origin=prop.erasure_origin_hash;
+    const size_t n=prop.erasure_n, k=prop.erasure_k, len=prop.erasure_shard_size;
+    if(!full_commands() || prop.full_broadcast!=benchmark_full_broadcast() ||
+            (prop.full_broadcast && (!directed || !strict_commands() || len!=prop.erasure_payload_size)) ||
+            n!=cfg.nreplicas || n>32 || k!=(prop.full_broadcast ? 1 : n-cfg.nmajority+1) || !k || k>n ||
+            prop.proposer>=n || prop.proposer!=pmaker->get_proposer() || prop.body_view!=get_view() ||
+            prop.erasure_part>=n || len==0 || len>MAX_BATCH_BYTES ||
+            n*len>64*1024*1024 || prop.erasure_payload_size<8 || prop.erasure_payload_size>MAX_BATCH_BYTES ||
+            prop.erasure_payload_size>k*len || prop.erasure_cmd_count>MAX_BATCH_COMMANDS ||
+            prop.erasure_cmd_count!=prop.blk->get_cmds().size() || prop.body_shard.size()!=len ||
+            prop.blk->get_hash()!=origin) return false;
+    if(directed ? (prop.erasure_part!=get_id() || peer!=cfg.get_addr(prop.proposer)) :
+                  peer!=cfg.get_addr(prop.erasure_part)) return false;
+    if(!prop.leader_cert || prop.leader_cert->get_obj_hash()!=prop.body_commitment() ||
+            !prop.leader_cert->verify(cfg.get_pubkey(prop.proposer))) {
+        LOG_WARN("body_signature_rejected"); return false;
+    }
+    const auto now=std::chrono::steady_clock::now();
+    size_t pool_bytes=0;
+    for(auto it=body_assemblies.begin();it!=body_assemblies.end();) {
+        if(it->second.first.body_view!=get_view() || now-it->second.created>std::chrono::seconds(30)) {
+            forwarded_erasure.erase(it->first); it=body_assemblies.erase(it);
+        } else { pool_bytes+=it->second.first.erasure_n*size_t(it->second.first.erasure_shard_size); ++it; }
+    }
+    for(auto it=body_completed.begin();it!=body_completed.end();) {
+        if(it->second+128<get_hqc()->get_height()) {
+            reconstructed_commands.erase(it->first); forwarded_erasure.erase(it->first);
+            it=body_completed.erase(it);
+        } else ++it;
+    }
+    if(body_completed.count(origin)) return true;
+    auto it=body_assemblies.find(origin);
+    if(it==body_assemblies.end()) {
+        if(body_completed.size()>=512 || body_assemblies.size()>=64 || pool_bytes+n*len>64*1024*1024) return false;
+        BodyAssembly a(prop); a.shards.resize(n); a.present.assign(n,0);
+        it=body_assemblies.emplace(origin,std::move(a)).first;
+    }
+    auto &a=it->second;
+    auto &f=a.first;
+    if(f.full_broadcast!=prop.full_broadcast || f.proposer!=prop.proposer ||
+            f.body_view!=prop.body_view || f.body_height!=prop.body_height ||
+            f.erasure_n!=n || f.erasure_k!=k || f.erasure_shard_size!=len ||
+            f.erasure_payload_size!=prop.erasure_payload_size || f.payload_hash!=prop.payload_hash ||
+            f.erasure_cmd_count!=prop.erasure_cmd_count) return false;
+    size_t index=prop.erasure_part;
+    if(a.present[index]) {
+        if(a.shards[index]!=prop.body_shard) { LOG_WARN("body_shard_conflict"); return false; }
+        // Duplicates can retry dependency delivery after a parent arrives.
+    } else { a.shards[index]=prop.body_shard; a.present[index]=1; ++a.count; }
+    if(a.count<k) return true;
+    std::vector<block_t> parents;
+    for(const auto &h:f.blk->get_parent_hashes()) {
+        auto p=storage->find_blk(h); if(!p || !storage->is_blk_delivered(h)) return true;
+        parents.push_back(p);
+    }
+    auto qc_ref=storage->find_blk(f.blk->get_qc_ref_hash());
+    if(parents.empty() || (f.blk->get_qc() && !qc_ref)) return true;
+    if(f.body_height!=parents[0]->get_height()+1) return false;
+    try {
+        auto start=std::chrono::steady_clock::now();
+        bytearray_t payload(f.erasure_payload_size);
+        if(f.full_broadcast) payload=a.shards[f.erasure_part];
+        else {
+        std::vector<bytearray_t> shards(n,bytearray_t(len,0));
+        std::vector<unsigned char*> ptrs(n);
+        for(size_t i=0;i<n;++i) { if(a.present[i]) shards[i]=a.shards[i]; ptrs[i]=shards[i].data(); }
+        const auto rs_start=std::chrono::steady_clock::now();
+        if(rs_reconstruct_data(n,k,len,ptrs.data(),a.present.data())) throw std::runtime_error("RS decode");
+        HOTSTUFF_LOG_INFO("rs_decode_only_us: %ld",std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-rs_start).count());
+        for(size_t i=0;i<payload.size();++i) payload[i]=shards[i/len][i%len];
+        }
+        DataStream ps(payload);
+        if(ps.get_hash()!=f.payload_hash) throw std::runtime_error("payload hash");
+        auto commands=decode_command_batch(payload,f.erasure_payload_size,f.blk->get_cmds());
+        for(const auto &c:commands) if(!validate_command_body(c)) throw std::runtime_error("command parse");
+        block_t restored=storage->add_blk(new Block(parents,f.blk->get_cmds(),
+                f.blk->get_qc()?f.blk->get_qc()->clone():nullptr,
+                bytearray_t(f.blk->get_extra()),f.body_height,qc_ref,nullptr));
+        if(salticidae::get_hash(*restored)!=origin ||
+                (restored->get_qc() && restored->get_qc()->get_obj_hash()!=Vote::proof_obj_hash(restored->get_qc_ref_hash())) ||
+                (qc_ref!=get_genesis() && !restored->verify(cfg))) throw std::runtime_error("block hash/QC");
+        {
+            std::lock_guard<std::mutex> lock(command_mutex);
+            size_t added=0, entries=0;
+            for(size_t i=0;i<commands.size();++i) {
+                auto found=command_bodies.find(f.blk->get_cmds()[i]);
+                if(!strict_commands() && found==command_bodies.end()) return true;
+                if(found!=command_bodies.end() && found->second!=commands[i]) throw std::runtime_error("shadow mismatch");
+                if(found==command_bodies.end()) { added+=commands[i].size(); ++entries; }
+            }
+            if(command_bytes+added>128*1024*1024 || command_bodies.size()+entries>8192) return false;
+            for(size_t i=0;i<commands.size();++i)
+                if(command_bodies.emplace(f.blk->get_cmds()[i],commands[i]).second) command_bytes+=commands[i].size();
+        }
+        Proposal complete(f.proposer,restored,nullptr);
+        reconstructed_commands.insert(origin); body_completed[origin]=f.body_height;
+        body_assemblies.erase(it);
+        HOTSTUFF_LOG_INFO("body_reconstructed: origin=%s rs_decode_us=%ld",get_hex10(origin).c_str(),
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count());
+        // Parents and QC were checked above. Deliver synchronously so an entire
+        // out-of-order chain can drain in one retry pass.
+        if(!storage->is_blk_delivered(origin)) on_deliver_blk(restored);
+        on_fetch_blk(restored);
+        on_receive_proposal(complete);
+        return true;
+    } catch(const std::exception &e) {
+        LOG_WARN("body_hash_failure: %s",e.what());
+        body_assemblies.erase(origin); forwarded_erasure.erase(origin); return false;
+    }
+}
+
 bool HotStuffBase::accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
                                             bool directed) {
     if (!prop.is_erasure_part || !prop.blk) return false;
+    if(prop.full_body) return accept_body_fragment(prop,peer,directed);
+    if(full_commands()) return false;
     const size_t expected_n = get_config().nreplicas;
     const size_t expected_k = expected_n - get_config().nmajority + 1;
     if (prop.erasure_n != expected_n || prop.erasure_k != expected_k ||
             prop.erasure_part >= prop.erasure_n || prop.erasure_k == 0 ||
             prop.erasure_shard_size == 0 ||
-            prop.erasure_shard_size % sizeof(uint256_t) != 0 ||
+            prop.erasure_shard_size % UINT256_SERIALIZED_SIZE != 0 ||
             prop.erasure_payload_size !=
-                prop.erasure_cmd_count * sizeof(uint256_t)) {
+                prop.erasure_cmd_count * UINT256_SERIALIZED_SIZE) {
         LOG_WARN("dropping erasure fragment with invalid metadata");
         return false;
     }
@@ -289,7 +405,8 @@ bool HotStuffBase::accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
     }
 
     const auto &fragment_cmds = prop.blk->get_cmds();
-    if (fragment_cmds.size() * sizeof(uint256_t) != prop.erasure_shard_size)
+    if (fragment_cmds.size() * UINT256_SERIALIZED_SIZE !=
+            prop.erasure_shard_size)
         return false;
     const uint256_t origin_hash = prop.erasure_origin_hash;
     if (completed_erasure.count(origin_hash)) return true;
@@ -321,8 +438,13 @@ bool HotStuffBase::accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
         assembly.shards[part].resize(assembly.shard_size);
         for (size_t i = 0; i < fragment_cmds.size(); ++i) {
             bytearray_t raw = fragment_cmds[i];
-            memcpy(assembly.shards[part].data() + i * sizeof(uint256_t),
-                    raw.data(), sizeof(uint256_t));
+            if (raw.size() != UINT256_SERIALIZED_SIZE) {
+                LOG_WARN("dropping erasure fragment with invalid uint256_t wire size");
+                return false;
+            }
+            memcpy(assembly.shards[part].data() +
+                        i * UINT256_SERIALIZED_SIZE,
+                    raw.data(), UINT256_SERIALIZED_SIZE);
         }
         assembly.present[part] = 1;
         ++assembly.received;
@@ -361,7 +483,8 @@ bool HotStuffBase::accept_erasure_fragment(Proposal &&prop, const NetAddr &peer,
 
     std::vector<uint256_t> final_cmds;
     final_cmds.reserve(assembly.cmd_count);
-    for (size_t offset = 0; offset < payload.size(); offset += sizeof(uint256_t))
+    for (size_t offset = 0; offset < payload.size();
+            offset += UINT256_SERIALIZED_SIZE)
         final_cmds.emplace_back(payload.data() + offset);
     std::vector<block_t> parents;
     for (const auto &parent_hash: assembly.template_blk->get_parent_hashes()) {
@@ -414,7 +537,7 @@ size_t HotStuffBase::erasure_send_copies() const {
 void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     const NetAddr &peer = conn->get_peer_addr();
     if (peer.is_null()) return;
-    msg.postponed_parse(this);
+    try { msg.postponed_parse(this); } catch(const std::exception &e) { LOG_WARN("proposal_parse_rejected: %s",e.what()); return; }
     auto &prop = msg.proposal;
     block_t blk = prop.blk;
     if (!blk) return;
@@ -425,6 +548,7 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
 
     if (!prop.is_erasure_part)
     {
+        if(full_commands()) return;
         promise::all(std::vector<promise_t>{
             async_deliver_blk(blk->get_hash(), peer)
         }).then([this, prop = std::move(prop)]() {
@@ -442,7 +566,7 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
 void HotStuffBase::repropose_handler(MsgRepropose &&msg, const Net::conn_t &conn) {
     const NetAddr &peer = conn->get_peer_addr();
     if (peer.is_null()) return;
-    msg.postponed_parse(this);
+    try { msg.postponed_parse(this); } catch(const std::exception &e) { LOG_WARN("proposal_parse_rejected: %s",e.what()); return; }
     if (should_drop_proposal()) {
         LOG_WARN("dropping re-proposal due to HOTSTUFF_DROP_PROPOSE_PCT=%d",
                 get_drop_propose_pct());
@@ -566,6 +690,7 @@ void HotStuffBase::stop_viewtrans_timer() {
 }
 
 void HotStuffBase::req_blk_handler(MsgReqBlock &&msg, const Net::conn_t &conn) {
+    if(full_commands()) return;
     const NetAddr replica = conn->get_peer_addr();
     if (replica.is_null()) return;
     auto &blk_hashes = msg.blk_hashes;
@@ -584,6 +709,7 @@ void HotStuffBase::req_blk_handler(MsgReqBlock &&msg, const Net::conn_t &conn) {
 }
 
 void HotStuffBase::resp_blk_handler(MsgRespBlock &&msg, const Net::conn_t &) {
+    if(full_commands()) return;
     msg.postponed_parse(this);
     for (const auto &blk: msg.blks)
         if (blk) on_fetch_blk(blk);
@@ -724,6 +850,7 @@ void HotStuffBase::do_consensus(const block_t &blk) {
 void HotStuffBase::do_decide(Finality &&fin) {
     part_decided++;
     state_machine_execute(fin);
+    if(full_commands()) forget_command(fin.cmd_hash);
     auto it = decision_waiting.find(fin.cmd_hash);
     if (it != decision_waiting.end())
     {
@@ -770,6 +897,37 @@ void HotStuffBase::start(
     if (ec_loop)
         ec.dispatch();
 
+    if(strict_commands() && !full_commands()) throw std::runtime_error("strict commands requires full mode");
+    if(benchmark_full_broadcast() && (!full_commands() || !strict_commands()))
+        throw std::runtime_error("full broadcast benchmark requires full strict mode");
+    if(full_commands()) {
+        body_gc_timer=TimerEvent(ec,[this](TimerEvent &) {
+            for(size_t pass=0;pass<64;++pass) {
+            const size_t before=body_assemblies.size();
+            auto now=std::chrono::steady_clock::now();
+            std::vector<Proposal> retry;
+            for(auto it=body_assemblies.begin();it!=body_assemblies.end();) {
+                if(it->second.first.body_view!=get_view() || now-it->second.created>std::chrono::seconds(30)) {
+                    forwarded_erasure.erase(it->first); it=body_assemblies.erase(it);
+                } else { if(it->second.count>=it->second.first.erasure_k) retry.push_back(it->second.first); ++it; }
+            }
+            for(auto &p:retry)
+                accept_body_fragment(p,get_config().get_addr(p.full_broadcast ? p.proposer : p.erasure_part),p.full_broadcast);
+            if(body_assemblies.size()>=before) break;
+            }
+            body_gc_timer.add(0.25);
+        });
+        body_gc_timer.add(0.25);
+    }
+    body_pending.reg_handler(ec, [this](body_queue_t &q) {
+        Proposal *queued;
+        while(q.try_dequeue(queued)) {
+            std::unique_ptr<Proposal> prop(queued);
+            const auto proposer=prop->proposer;
+            accept_erasure_fragment(std::move(*prop),get_config().get_addr(proposer),true);
+        }
+        return true;
+    });
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
         std::pair<uint256_t, commit_cb_t> e;
         while (q.try_dequeue(e))
@@ -788,6 +946,10 @@ void HotStuffBase::start(
             else
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
             if (proposer != get_id()) continue;
+            if(full_commands()) {
+                std::lock_guard<std::mutex> lock(command_mutex);
+                if(!command_bodies.count(cmd_hash)) continue;
+            }
             cmd_pending_buffer.push(cmd_hash);
             if (cmd_pending_buffer.size() >= blk_size)
             {

@@ -40,6 +40,14 @@ using salticidae::from_hex;
 using salticidae::bytearray_t;
 using salticidae::get_hash;
 
+/** Wire-format size of a serialized uint256_t.
+ *
+ * Do not replace this with sizeof(uint256_t): Blob<256, uint64_t> also stores
+ * bookkeeping state and may contain ABI padding, while its serialized value is
+ * always exactly 256 bits.
+ */
+constexpr size_t UINT256_SERIALIZED_SIZE = 256 / 8;
+
 using salticidae::NetAddr;
 using salticidae::TimerEvent;
 using salticidae::FdEvent;

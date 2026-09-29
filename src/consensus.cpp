@@ -21,6 +21,7 @@
 #include "hotstuff/util.h"
 #include "hotstuff/consensus.h"
 #include "code_function.h"
+#include <chrono>
 
 #define LOG_INFO HOTSTUFF_LOG_INFO
 #define LOG_DEBUG HOTSTUFF_LOG_DEBUG
@@ -106,6 +107,9 @@ void HotStuffCore::check_commit(const block_t &blk) {
     block_t b;
     for (b = blk; b->height > b_exec->height; b = b->parents[0])
     { /* TODO: also commit the uncles/aunts */
+        if(full_commands() && !reconstructed_commands.count(b->get_hash())) {
+            LOG_WARN("body_commit_blocked"); return;
+        }
         commit_queue.push_back(b);
     }
     if (b != b_exec)
@@ -128,6 +132,10 @@ void HotStuffCore::check_commit(const block_t &blk) {
 // 2. Vote
 void HotStuffCore::_vote(const block_t &blk) {
     const auto &blk_hash = blk->get_hash();
+    if(full_commands() && !reconstructed_commands.count(blk_hash)) {
+        LOG_WARN("body_vote_blocked"); return;
+    }
+    if(full_commands()) HOTSTUFF_LOG_INFO("body_vote: origin=%s",get_hex10(blk_hash).c_str());
     LOG_PROTO("vote for %s", get_hex10(blk_hash).c_str());
     Vote vote(id, blk_hash,
             create_part_cert(
@@ -198,16 +206,43 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     /* self-vote */
     if (bnew->height <= vheight)
         throw std::runtime_error("new block should be higher than vheight");
-    vheight = bnew->height;
-    finished_propose[bnew] = true;
-    _vote(bnew);
+    if(!full_commands()) {
+        vheight = bnew->height;
+        finished_propose[bnew] = true;
+        _vote(bnew);
+    }
     on_propose_(prop);
     const size_t n = config.nreplicas;
     const size_t k = n - config.nmajority + 1;
-    const size_t payload_size = cmds.size() * sizeof(uint256_t);
-    const size_t shard_size = std::max<size_t>(sizeof(uint256_t),
-            ((payload_size + k - 1) / k + sizeof(uint256_t) - 1) /
-            sizeof(uint256_t) * sizeof(uint256_t));
+    bytearray_t full_payload;
+    if(full_commands()) full_payload=make_command_batch(cmds);
+    if(full_commands() && benchmark_full_broadcast()) {
+        if(n>32 || full_payload.size()>MAX_BATCH_BYTES ||
+                n*full_payload.size()>64*1024*1024)
+            throw std::runtime_error("broadcast allocation limit");
+        DataStream body(full_payload);
+        const auto payload_hash=body.get_hash();
+        std::vector<Proposal> copies;
+        for(size_t i=0;i<n;++i) {
+            Proposal p(id,bnew,nullptr);
+            p.is_erasure_part=p.full_body=p.full_broadcast=true;
+            p.erasure_n=n;p.erasure_k=1;p.erasure_part=i;
+            p.erasure_shard_size=p.erasure_payload_size=full_payload.size();
+            p.erasure_cmd_count=cmds.size();p.erasure_origin_hash=bnew_hash;
+            p.body_view=view;p.body_height=bnew->height;p.payload_hash=payload_hash;
+            p.body_shard=full_payload;
+            p.leader_cert=create_part_cert(*priv_key,p.body_commitment());
+            copies.push_back(std::move(p));
+        }
+        do_send_erasure_proposals(copies);
+        return bnew;
+    }
+    const size_t payload_size = full_commands() ? full_payload.size() : cmds.size() * UINT256_SERIALIZED_SIZE;
+    const size_t shard_size = std::max<size_t>(UINT256_SERIALIZED_SIZE,
+            ((payload_size + k - 1) / k + UINT256_SERIALIZED_SIZE - 1) /
+            UINT256_SERIALIZED_SIZE * UINT256_SERIALIZED_SIZE);
+    if(n>32 || !k || k>n || payload_size>MAX_BATCH_BYTES || n*shard_size>64*1024*1024)
+        throw std::runtime_error("RS allocation limit");
     std::vector<unsigned char *> shards(n, nullptr);
     for (size_t i = 0; i < n; ++i) {
         void *buf = nullptr;
@@ -219,9 +254,15 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
         memset(shards[i], 0, shard_size);
     }
     std::vector<unsigned char> payload(payload_size);
-    for (size_t i = 0; i < cmds.size(); ++i) {
+    if(full_commands()) payload=full_payload;
+    else for (size_t i = 0; i < cmds.size(); ++i) {
         bytearray_t raw = cmds[i];
-        memcpy(payload.data() + i * sizeof(uint256_t), raw.data(), sizeof(uint256_t));
+        if (raw.size() != UINT256_SERIALIZED_SIZE) {
+            for (auto shard: shards) free(shard);
+            throw std::runtime_error("invalid uint256_t wire size");
+        }
+        memcpy(payload.data() + i * UINT256_SERIALIZED_SIZE,
+                raw.data(), UINT256_SERIALIZED_SIZE);
     }
     /* The k data buffers are contiguous in the logical payload. */
     for (size_t i = 0; i < k; ++i) {
@@ -230,19 +271,25 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
                 std::min(shard_size, payload_size - offset) : 0;
         if (count) memcpy(shards[i], payload.data() + offset, count);
     }
+    const auto encode_start=std::chrono::steady_clock::now();
     if (rs_encode_shards((int)n, (int)k, (int)shard_size, shards.data()) != 0) {
         for (auto shard: shards) free(shard);
         throw std::runtime_error("Reed-Solomon encoding failed");
     }
 
+    if(full_commands()) HOTSTUFF_LOG_INFO("rs_encode_us: %ld",
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-encode_start).count());
     std::vector<Proposal> erasure_proposals;
     erasure_proposals.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         std::vector<uint256_t> shard_cmds;
-        shard_cmds.reserve(shard_size / sizeof(uint256_t));
-        for (size_t offset = 0; offset < shard_size; offset += sizeof(uint256_t))
+        if(!full_commands()) {
+        shard_cmds.reserve(shard_size / UINT256_SERIALIZED_SIZE);
+        for (size_t offset = 0; offset < shard_size;
+                offset += UINT256_SERIALIZED_SIZE)
             shard_cmds.emplace_back(shards[i] + offset);
-        block_t fragment = storage->add_blk(new Block(parents, shard_cmds,
+        }
+        block_t fragment = full_commands() ? bnew : storage->add_blk(new Block(parents, shard_cmds,
                     hqc.second->clone(), bytearray_t(fragment_extra),
                     parents[0]->height + 1, hqc.first, nullptr));
         Proposal fragment_prop(id, fragment, nullptr);
@@ -254,6 +301,16 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
         fragment_prop.erasure_payload_size = (uint32_t)payload_size;
         fragment_prop.erasure_cmd_count = (uint32_t)cmds.size();
         fragment_prop.erasure_origin_hash = bnew_hash;
+        if(full_commands()) {
+            fragment_prop.full_body=true;
+            fragment_prop.blk=bnew;
+            fragment_prop.body_view=view;
+            fragment_prop.body_height=bnew->height;
+            DataStream body(full_payload);
+            fragment_prop.payload_hash=body.get_hash();
+            fragment_prop.body_shard.assign(shards[i],shards[i]+shard_size);
+            fragment_prop.leader_cert=create_part_cert(*priv_key,fragment_prop.body_commitment());
+        }
         erasure_proposals.push_back(std::move(fragment_prop));
     }
     for (auto shard: shards) free(shard);
@@ -263,6 +320,7 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
 
 void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     if (view_trans) return;
+    if(full_commands() && !reconstructed_commands.count(prop.blk->get_hash())) return;
     LOG_PROTO("got %s", std::string(prop).c_str());
     block_t bnew = prop.blk;
     if (finished_propose[bnew]) return;
