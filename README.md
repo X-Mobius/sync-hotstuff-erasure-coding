@@ -1,154 +1,50 @@
-# Sync HotStuff Erasure Coding Prototype
+# Sync HotStuff with Erasure-Coded Command Propagation
 
-This repository is a course research prototype based on
-[libhotstuff](https://github.com/hot-stuff/libhotstuff). It explores how
-erasure coding can be integrated into the proposal path of HotStuff-style BFT
-state machine replication.
+This course research prototype extends [librightstuff](https://github.com/hot-stuff/librightstuff) with Reed–Solomon (RS) propagation of complete command batches. The original project history and Apache-2.0 license are retained. This is an experimental consensus implementation, not a production BFT system.
 
-The project focuses on a prototype-level modification rather than a production
-consensus implementation. Its main goal is to study whether a leader can reduce
-the amount of full-block data it sends during the `Propose` phase by sending
-encoded fragments and allowing replicas to reconstruct the original block before
-voting.
+## What this version implements
 
-## Background
+In strict mode, a client sends a complete command to the leader. The leader forms a versioned command batch, creates `n` RS shards, signs each proposal, and sends a shard to each replica. Replicas forward their authenticated shards in a Re-propose step. After collecting `k` distinct shards, a replica reconstructs the batch, checks its payload hash, re-parses and hashes every command, rebuilds the original block, and verifies its hash and QC. Voting and commit processing require successful reconstruction. The leader follows the same reconstruction gate.
 
-HotStuff is a Byzantine fault-tolerant consensus protocol designed for
-blockchain-style state machine replication. In the original proposal flow, the
-leader sends the proposed block data to replicas. When block data becomes large,
-this can make the leader a communication bottleneck.
+The earlier hash-list RS path remains for compatibility. Shadow mode compares reconstruction with a locally available complete command. A benchmark-only full-broadcast mode sends the same complete batch to every replica without RS; it provides a like-for-like leader-ingress comparison with strict RS. These modes are selected explicitly by the test environment; see the [final experimental report](benchmarks/full-command-payload-20260909-final/REPORT.md) for wire formats, controls, and limits.
 
-This project studies an erasure-coding-based proposal prototype:
+## Build from a clean clone
 
-1. The leader encodes block commands into fragments.
-2. Encoded proposal parts carry metadata such as the fragment index, original
-   command count, and original block hash.
-3. Replicas collect enough encoded parts, decode the original command list, and
-   rebuild the original block.
-4. The rebuilt block is checked against the original block hash before it enters
-   the normal HotStuff proposal handling path.
-
-The current implementation keeps the original libhotstuff safety and liveness
-logic mostly intact, and adds the erasure-coding path around proposal delivery.
-
-## Main Changes
-
-- Added Reed-Solomon style erasure coding helpers derived from Intel ISA-L test
-  code.
-- Integrated encoding before the leader broadcasts proposal data.
-- Extended `Proposal` messages with erasure-coding metadata.
-- Added replica-side fragment caching and decode-before-vote logic.
-- Rebuilt decoded blocks and verified their hash before passing them to the
-  original HotStuff proposal handler.
-- Fixed several integration issues found during testing, including fragment
-  indexing, metadata transmission, buffer initialization, memory management, and
-  block reconstruction.
-
-## Repository Layout
-
-```text
-include/code_function.h      Erasure coding function interface
-include/ec_base.h            GF table data used by the coding functions
-src/code_function.c          Encoding and decoding implementation
-src/consensus.cpp            Proposal-side encoding integration
-src/hotstuff.cpp             Replica-side decoding and proposal handling
-test/test_function.c         Standalone erasure coding recovery test
-```
-
-The original libhotstuff structure is otherwise preserved.
-
-## Build
-
-The project was tested on Ubuntu 20.04.
-
-Install dependencies:
+The project was tested on an Ubuntu VM with CMake, a C/C++ toolchain, OpenSSL, libuv, and the repository's secp256k1 and Salticidae submodules. Install the platform dependencies first, then run:
 
 ```bash
-sudo apt-get install libssl-dev libuv1-dev cmake make g++
-```
-
-Build:
-
-```bash
-cd ~/librightstuff
-make -j2
-```
-
-If building from a clean checkout, initialize submodules and configure CMake as
-in the original libhotstuff project:
-
-```bash
+git clone https://github.com/X-Mobius/sync-hotstuff-erasure-coding.git
+cd sync-hotstuff-erasure-coding
 git submodule update --init --recursive
-cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON .
+bash scripts/apply_salticidae_patches.sh
+cmake -S . -B . -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON
 make -j2
 ```
 
-## Run Tests
+The pinned upstream Salticidae commit needs two small, tracked patches: serialized-message byte accounting and a libuv handle destruction fix. `apply_salticidae_patches.sh` checks the pinned commit and applies them idempotently. The Salticidae checkout then appears modified by design; no unpublished submodule commit is required.
 
-Run the standalone erasure coding test:
-
-```bash
-./test/test_functions
-```
-
-Expected output:
-
-```text
-Success!
-```
-
-Run the original secp256k1 test:
+## Focused tests
 
 ```bash
-./test/test_secp256k1
+./test/test_command_batch
+./test/test_full_proposal
+./test/test_full_command_state
+./test/test_reproposal_rs
+bash scripts/run_full_command_asan.sh
 ```
 
-## Run Demo
+The test suite covers command format boundaries, 944 RS recovery subsets, signature and byte-tampering rejection, fragment ordering/conflicts, and state recovery. The ASan script builds and tests the protocol and dependency objects with leak detection. The archived full matrix uses seven local replicas and is described in the final report; its scripts require an explicitly prepared original baseline and generated seven-node configuration.
 
-Start replicas in one terminal:
+## Results and interpretation
 
-```bash
-./scripts/run_demo.sh 0 1 2
-```
+The [final report and CSVs](benchmarks/full-command-payload-20260909-final/REPORT.md) contain the 81/81 performance runs, 15/15 positive correctness runs, and the insufficient-shards negative test. In the seven-replica, 64 KiB command, batch-64 setting, strict RS versus the *full-broadcast comparator* reduced leader Proposal bytes per confirmed command by **74.91%** and all leader outgoing message bytes by **49.81%**. Cluster outgoing bytes increased by about **99.39%**, and throughput decreased by about **2.42%**. This comparison uses the same client-to-leader entry path in both modes.
 
-Start the client in another terminal:
+The native baseline is a different topology: its client sends complete commands to all replicas while the leader mainly proposes hashes. It must not be used to claim that RS reduces the native baseline's leader or total network traffic. Earlier 28.4%/52.2% figures describe the hash-list implementation, not this complete-command version.
 
-```bash
-./scripts/run_demo_client.sh
-```
+## Limits
 
-Healthy output contains repeated finality messages such as:
+The tests use seven processes on one Ubuntu VM and a stable leader. Offline-node and missing-shard tests do not establish resistance to malicious fragments or a malicious leader. The client does not automatically follow view changes. The implementation has bounded in-memory caches and no production-grade backpressure, persistence, or long-term state transfer. Network-byte measurements count application serialized messages and Salticidae frames, not TCP/IP retransmissions or physical-link overhead. Full details are in the report.
 
-```text
-got <fin decision=1 cmd_idx=0 cmd_height=...>
-send new cmd ...
-```
+## Attribution
 
-You can stop the client and replicas with `Ctrl+C`. Replica logs are written to
-`log0`, `log1`, and `log2`.
-
-## Notes and Limitations
-
-- This is a research/course prototype, not a production-ready BFT system.
-- The current demo-oriented implementation broadcasts encoded proposal parts to
-  all replicas to keep the original libhotstuff demo path stable.
-- A fully optimized design should implement the complete `Re-propose` step,
-  where replicas forward fragments to each other and decode after collecting
-  enough valid fragments.
-- Erasure coding can reduce the leader's full-block broadcast pressure in the
-  intended design, but redundant fragments and re-proposal forwarding may add
-  extra communication. End-to-end communication benefits should be evaluated
-  with experiments.
-
-## Acknowledgements
-
-This project is based on the open-source
-[libhotstuff](https://github.com/hot-stuff/libhotstuff) prototype.
-
-Original HotStuff papers:
-
-- [HotStuff: BFT Consensus in the Lens of Blockchain](https://arxiv.org/abs/1803.05069)
-- [PODC 2019 paper](https://dl.acm.org/citation.cfm?id=3331591)
-
-Erasure coding code in this project is adapted from concepts and test code in
-Intel ISA-L.
+This repository is derived from the upstream [librightstuff](https://github.com/hot-stuff/librightstuff) / [libhotstuff](https://github.com/hot-stuff/libhotstuff) work. The original commit history, notices, license, and submodule attribution remain in place. RS helper code draws on Intel ISA-L examples, as described in the original project files.
